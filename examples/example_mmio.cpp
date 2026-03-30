@@ -14,7 +14,8 @@
 #include <vector>
 
 // Broadcast a CSRMatrix from rank 0 to all other ranks.
-static void bcast_csr(CSRMatrix& mat, int root, MPI_Comm comm) {
+static void bcast_csr(CSRMatrix& mat, int root, MPI_Comm comm)
+{
     MPI_Bcast(&mat.n,   1, MPI_INT, root, comm);
     MPI_Bcast(&mat.m,   1, MPI_INT, root, comm);
     MPI_Bcast(&mat.nnz, 1, MPI_INT, root, comm);
@@ -33,12 +34,13 @@ static void bcast_csr(CSRMatrix& mat, int root, MPI_Comm comm) {
     MPI_Bcast(mat.a.data(),  mat.nnz,   MPI_DOUBLE, root, comm);
 }
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[])
+{
     MPI_Init(&argc, &argv);
 
-    int rank, size;
+    int rank, nprocs;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
 
     // ----------------------------------------------------------------
     // 1. Parse command-line arguments.
@@ -72,10 +74,10 @@ int main(int argc, char* argv[]) {
     // ----------------------------------------------------------------
     std::vector<int> row_to_rank(N);
     {
-        int rows_per_rank = N / size;
-        int remainder     = N % size;
+        int rows_per_rank = N / nprocs;
+        int remainder     = N % nprocs;
         int offset = 0;
-        for (int r = 0; r < size; ++r) {
+        for (int r = 0; r < nprocs; ++r) {
             int count = rows_per_rank + (r < remainder ? 1 : 0);
             for (int j = 0; j < count; ++j) {
                 row_to_rank[offset + j] = r;
@@ -86,36 +88,42 @@ int main(int argc, char* argv[]) {
 
     // ----------------------------------------------------------------
     // 5. Set up RHS: b = [1, 1, ..., 1].
+    //    Extract the local portion for this rank.
     // ----------------------------------------------------------------
-    std::vector<double> b(N, 1.0);
-    std::vector<double> x(N, 0.0);
+    std::vector<int> local_rows;
+    for (int i = 0; i < N; ++i) {
+        if (row_to_rank[i] == rank)
+            local_rows.push_back(i);
+    }
+    const int local_n = static_cast<int>(local_rows.size());
+
+    std::vector<double> b_global(N, 1.0);
+    std::vector<double> b_local(local_n);
+    for (int li = 0; li < local_n; ++li) {
+        b_local[li] = b_global[local_rows[li]];
+    }
 
     // ----------------------------------------------------------------
     // 6. Solve with PardisoMPI.
     // ----------------------------------------------------------------
-    PardisoMPI solver;
-    solver.set_matrix_type(PardisoMPI::REAL_NONSYMMETRIC);
-    solver.set_message_level(0);
+    PardisoMPI solver(MPI_COMM_WORLD);
+    solver.set_matrix_type(11); // real unsymmetric
 
-    int error = solver.solve(A, b.data(), x.data(), row_to_rank, MPI_COMM_WORLD);
+    solver.set_matrix(N, A.ia.data(), A.ja.data(), A.a.data(),
+                      row_to_rank.data());
+    solver.factorize();
 
-    if (error != 0) {
-        if (rank == 0)
-            std::fprintf(stderr, "PardisoMPI solve failed with error %d\n", error);
-        MPI_Finalize();
-        return 1;
-    }
+    std::vector<double> x_local(local_n, 0.0);
+    solver.solve(b_local.data(), x_local.data());
 
     // ----------------------------------------------------------------
-    // 7. Print solution (each rank prints its rows).
+    // 7. Print solution (each rank prints its rows in order).
     // ----------------------------------------------------------------
-    for (int r = 0; r < size; ++r) {
+    for (int r = 0; r < nprocs; ++r) {
         if (rank == r) {
             std::printf("Rank %d solution:\n", rank);
-            for (int i = 0; i < N; ++i) {
-                if (row_to_rank[i] == rank) {
-                    std::printf("  x[%2d] = %12.6e\n", i, x[i]);
-                }
+            for (int li = 0; li < local_n; ++li) {
+                std::printf("  x[%2d] = %12.6e\n", local_rows[li], x_local[li]);
             }
             std::fflush(stdout);
         }
@@ -123,23 +131,50 @@ int main(int argc, char* argv[]) {
     }
 
     // ----------------------------------------------------------------
-    // 8. Compute and print residual ||Ax - b||_2 on rank 0.
+    // 8. Gather full solution on rank 0 and compute residual.
     // ----------------------------------------------------------------
+    std::vector<int> recv_counts(nprocs), recv_displs(nprocs);
+    MPI_Gather(&local_n, 1, MPI_INT, recv_counts.data(), 1, MPI_INT,
+               0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        std::vector<double> r_vec(N, 0.0);
+        recv_displs[0] = 0;
+        for (int r = 1; r < nprocs; ++r)
+            recv_displs[r] = recv_displs[r - 1] + recv_counts[r - 1];
+    }
+
+    std::vector<int> all_rows(rank == 0 ? N : 0);
+    MPI_Gatherv(local_rows.data(), local_n, MPI_INT,
+                all_rows.data(), recv_counts.data(), recv_displs.data(),
+                MPI_INT, 0, MPI_COMM_WORLD);
+
+    std::vector<double> all_x_flat(rank == 0 ? N : 0);
+    MPI_Gatherv(x_local.data(), local_n, MPI_DOUBLE,
+                all_x_flat.data(), recv_counts.data(), recv_displs.data(),
+                MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        // Reassemble global solution.
+        std::vector<double> x_global(N, 0.0);
+        for (int k = 0; k < N; ++k) {
+            x_global[all_rows[k]] = all_x_flat[k];
+        }
+
+        // Compute residual r = A*x - b.
+        std::vector<double> residual(N, 0.0);
         for (int i = 0; i < N; ++i) {
             double sum = 0.0;
             for (int k = A.ia[i] - 1; k < A.ia[i + 1] - 1; ++k) {
-                int j = A.ja[k] - 1;
-                sum += A.a[k] * x[j];
+                int col = A.ja[k] - 1;
+                sum += A.a[k] * x_global[col];
             }
-            r_vec[i] = sum - b[i];
+            residual[i] = sum - b_global[i];
         }
 
-        double norm = 0.0;
-        for (int i = 0; i < N; ++i) norm += r_vec[i] * r_vec[i];
-        norm = std::sqrt(norm);
-        std::printf("\nResidual ||Ax - b||_2 = %e\n", norm);
+        double res_norm = 0.0;
+        for (int i = 0; i < N; ++i) res_norm += residual[i] * residual[i];
+        res_norm = std::sqrt(res_norm);
+        std::printf("\nResidual ||Ax - b||_2 = %e\n", res_norm);
     }
 
     MPI_Finalize();
