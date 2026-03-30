@@ -28,27 +28,35 @@ input** (`iparm[39] = 2`):
 
 - Every rank calls each method (all operations are **collective**).
 - Each rank provides only the matrix rows it owns via `set_matrix()`.
-  Row ownership is specified by `first_row` / `last_row` (1-based).
-- `iparm[40]` and `iparm[41]` tell Cluster PARDISO each rank's row range.
-- Every rank must supply the full global RHS to `solve()`.
-- After a solve, the solution is assembled on every rank via
-  `MPI_Allgatherv`.
+  The owned rows need **not** be contiguous — the wrapper builds a
+  symmetric permutation that maps each rank's rows to a contiguous
+  block, remaps column indices, and inverse-permutes the solution.
+- `iparm[40]` and `iparm[41]` tell Cluster PARDISO each rank's
+  (contiguous, permuted) row range.
+- Every rank must supply the full global RHS to `solve()`.  The wrapper
+  permutes the RHS internally before extracting the local portion.
+- After a solve, the permuted solution is assembled via
+  `MPI_Allgatherv`, then inverse-permuted back to the original
+  ordering on every rank.
 
 ## Data Flow: `PardisoMPI`
 
-### `set_matrix(n, first_row, last_row, ia, ja, a)`
+### `set_matrix(n, local_nrows, owned_rows, ia, ja, a)`
 
-Collective.  Each rank stores its local rows in 1-based CSR.
+Collective.  Each rank provides its owned rows (which may be
+non-contiguous) and the corresponding local CSR data.
 
 ```
-Each rank stores:
-  local_ia_ = ia  (size: local_nrows + 1, 1-based)
-  local_ja_ = ja  (global 1-based column indices)
-  local_a_  = a   (values for local rows)
+1. MPI_Allgather + MPI_Allgatherv to collect owned_rows from all ranks.
+2. Build permutation perm_/iperm_:
+     perm_[new_idx]  = old_idx   (0-based)
+     iperm_[old_idx] = new_idx   (0-based)
+   Rank 0's rows become permuted rows [0, n0), rank 1 gets [n0, n0+n1), etc.
+3. Copy local CSR and remap column indices:
+     new_col = iperm_[old_col - 1] + 1
+   Then re-sort columns within each row (PARDISO requires sorted columns).
+4. Compute contiguous first_row_/last_row_ from gather_displs_.
 ```
-
-One `MPI_Allgather` exchanges the local row counts to precompute
-gather metadata used by `solve()`.
 
 ### `factorize()`  — Cluster PARDISO phases 11 + 22
 
@@ -66,20 +74,18 @@ iparm[39]=2, iparm[40]=first_row, iparm[41]=last_row.
 Internally, Cluster PARDISO distributes the work (reordering, LU factors)
 across all ranks using MPI.
 
-### `solve(rhs, sol)`  — Cluster PARDISO phase 33 + broadcast
+### `solve(rhs, sol)`  — Cluster PARDISO phase 33 + inverse permute
 
 Collective.  All ranks participate in the distributed solve.
 
 ```
-Each rank extracts its local portion of the RHS and calls:
-    cluster_sparse_solver(phase=33)   — forward/backward substitution
+1. Permute full RHS:  perm_rhs[new_i] = rhs[perm_[new_i]]
+2. Each rank extracts its local portion of perm_rhs and calls:
+     cluster_sparse_solver(phase=33)   — forward/backward substitution
+3. MPI_Allgatherv assembles the full permuted solution.
+4. Inverse-permute:  sol[perm_[i]] = perm_sol[i]
 
-Each rank receives its local portion of the solution.
-
-Then:
-    MPI_Allgatherv(local_sol -> sol)
-
-Every rank now has the full solution.
+Every rank now has the full solution in the original ordering.
 ```
 
 ### `pardiso_cleanup()`  — phase -1
@@ -99,26 +105,29 @@ global RHS vector.
 
 ```
 1. triplets_to_csr(triplets):
-     - Sort all triplets by (row, col)
+     - Filter triplets to this rank's rows (block partition)
+     - Sort by (local_row, col)
      - Merge duplicates: entries with same (row,col) have values summed
-     - Build 1-based CSR arrays ia_, ja_, a_
-2. pardiso_.set_matrix(n, ia, ja, a)   — rank 0 stores full CSR
-3. pardiso_.factorize()                — distributed factorization
+     - Build local 1-based CSR arrays ia_, ja_, a_
+2. Build owned_rows array for this rank's block partition
+3. pardiso_.set_matrix(n, local_nrows, owned_rows, ia, ja, a)
+     — builds permutation, remaps columns
+4. pardiso_.factorize()  — distributed factorization
 ```
 
 ### `solve(rhs, sol)`
 
 ```
 1. pardiso_.solve(rhs, sol)
-     - Cluster PARDISO phase 33 (distributed solve)
-     - MPI_Bcast sends the full solution to all ranks
+     - Permute RHS, Cluster PARDISO phase 33, inverse-permute solution
+     - MPI_Allgatherv assembles the full solution on all ranks
 ```
 
 ## Communication Summary
 
 | Operation          | MPI Calls                                         | Direction     |
 |--------------------|---------------------------------------------------|---------------|
-| `set_matrix`       | `MPI_Allgather` (gather metadata for solve)       | all → all     |
+| `set_matrix`       | `MPI_Allgather` + `MPI_Allgatherv` (permutation)  | all → all     |
 | `factorize`        | Internal to Cluster PARDISO (phases 11 + 22)      | all ↔ all     |
 | `solve`            | Internal to Cluster PARDISO (phase 33) + `MPI_Allgatherv` | all ↔ all  |
 | `pardiso_cleanup`  | Internal to Cluster PARDISO (phase -1)            | all ↔ all     |
@@ -126,8 +135,9 @@ global RHS vector.
 All operations are **collective** — every rank in the communicator must
 participate.  The internal MPI communication is managed entirely by
 Cluster PARDISO; the explicit MPI calls in the wrapper are
-`MPI_Allgather` in `set_matrix` (to exchange row counts) and
-`MPI_Allgatherv` after the solve (to assemble the full solution).
+`MPI_Allgather` + `MPI_Allgatherv` in `set_matrix` (to build the
+permutation) and `MPI_Allgatherv` after the solve (to assemble and
+inverse-permute the solution).
 
 ## Sequence Diagram (PlantUML)
 
@@ -142,10 +152,10 @@ participant "Caller"              as C
 participant "All MPI Ranks"       as R
 participant "Cluster PARDISO\n(MKL internal)" as P
 
-== set_matrix(n, first_row, last_row, ia, ja, a) ==
+== set_matrix(n, local_nrows, owned_rows, ia, ja, a) ==
 
 C -> R : set_matrix()
-R -> R : Each rank stores local CSR\n+ MPI_Allgather(counts)
+R -> R : Allgather owned_rows\n→ build perm/iperm\n→ remap columns, re-sort
 
 == factorize() ==
 
@@ -158,13 +168,15 @@ R <-- P : distributed L/U factors
 == solve(rhs, sol) ==
 
 C -> R : solve()
+R -> R : Permute RHS → extract local portion
 R -> P : cluster_sparse_solver(phase=33)\n[solve — all ranks, local RHS]
-R <-- P : local solution on each rank
-R -> R : MPI_Allgatherv(sol)
+R <-- P : local permuted solution
+R -> R : MPI_Allgatherv + inverse permute
 
 note over R
   Every rank now has
-  the full solution.
+  the full solution
+  in original ordering.
 end note
 
 == destructor ==
@@ -193,7 +205,7 @@ C -> S : update(triplets)
 
 S -> S : triplets_to_csr():\n1. Filter to local rows\n2. Sort by (row, col)\n3. Sum duplicates\n4. Build local 1-based CSR
 
-S -> PM : set_matrix(n, first_row, last_row, ia, ja, a)
+S -> PM : set_matrix(n, local_nrows, owned_rows, ia, ja, a)
 S -> PM : factorize()
 PM -> P : phase 11 + 22 (distributed)
 
@@ -201,8 +213,9 @@ PM -> P : phase 11 + 22 (distributed)
 
 C -> S : solve(rhs, sol)
 S -> PM : solve(rhs, sol)
+PM -> PM : Permute RHS
 PM -> P : phase 33 (distributed)
-PM -> PM : MPI_Allgatherv(sol)
+PM -> PM : MPI_Allgatherv + inverse permute
 
 S --> C : sol[] filled on every rank
 
@@ -234,16 +247,20 @@ The CMakeLists.txt handles both cases.
 
 ## Limitations and Design Choices
 
-- **Distributed input**: Each rank provides only its block of rows
-  (`iparm[39] = 2`).  This is memory-efficient for large matrices since
-  no single rank needs to store the full CSR.  Row partitioning is the
-  caller's responsibility for `PardisoMPI`; `SparseMatrixSolvePardiso`
-  handles it automatically with a simple block distribution.
+- **Distributed input with permutation**: Each rank provides its owned
+  rows (`iparm[39] = 2`), which need not be contiguous.  The wrapper
+  builds a symmetric permutation P so that each rank's rows form a
+  contiguous block for Cluster PARDISO.  Column indices are remapped via
+  P, and the solution is inverse-permuted after the solve.  This adds
+  O(n) work per `set_matrix` call (for the `MPI_Allgatherv` of row
+  indices and the column remapping), but makes the API flexible for
+  arbitrary partitionings.
 
-- **Allgather after solve**: With distributed input, each rank receives
-  only its local portion of the solution from Cluster PARDISO.  The
-  wrapper uses `MPI_Allgatherv` so that every rank has the full result,
-  matching the caller's expectation.
+- **Allgather + inverse permute after solve**: Each rank receives its
+  local portion of the permuted solution from Cluster PARDISO.  The
+  wrapper uses `MPI_Allgatherv` to assemble the full permuted solution,
+  then inverse-permutes it so every rank has the result in the original
+  ordering.
 
 - **1-based indexing**: PARDISO requires 1-based CSR.  All internal storage
   uses 1-based indexing.  `SparseMatrixSolvePardiso` accepts 0-based triplets

@@ -1,6 +1,7 @@
 #include "pardiso_mpi.h"
 
 #include <mkl_cluster_sparse_solver.h>
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -65,9 +66,10 @@ void PardisoMPI::set_matrix_type(int mtype)
 }
 
 // ---------------------------------------------------------------------------
-// set_matrix — each rank stores its local rows
+// set_matrix — each rank stores its local rows, permuted to contiguous
 // ---------------------------------------------------------------------------
-void PardisoMPI::set_matrix(int n, int first_row, int last_row,
+void PardisoMPI::set_matrix(int n, int local_nrows,
+                            const int* owned_rows,
                             const int* ia,
                             const int* ja,
                             const double* a)
@@ -79,23 +81,8 @@ void PardisoMPI::set_matrix(int n, int first_row, int last_row,
     }
 
     n_ = n;
-    first_row_ = first_row;
-    last_row_  = last_row;
 
-    const int local_nrows = last_row - first_row + 1;
-
-    if (local_nrows > 0) {
-        const int local_nnz = ia[local_nrows] - 1; // ia is 1-based
-        local_ia_.assign(ia, ia + local_nrows + 1);
-        local_ja_.assign(ja, ja + local_nnz);
-        local_a_.assign(a, a + local_nnz);
-    } else {
-        local_ia_.clear();
-        local_ja_.clear();
-        local_a_.clear();
-    }
-
-    // Precompute gather metadata for MPI_Allgatherv in solve().
+    // 1. Allgather row counts and displacements.
     gather_counts_.resize(comm_size_);
     gather_displs_.resize(comm_size_);
     MPI_Allgather(&local_nrows, 1, MPI_INT,
@@ -103,6 +90,64 @@ void PardisoMPI::set_matrix(int n, int first_row, int last_row,
     gather_displs_[0] = 0;
     for (int i = 1; i < comm_size_; ++i)
         gather_displs_[i] = gather_displs_[i - 1] + gather_counts_[i - 1];
+
+    // 2. Allgatherv owned_rows to build the global permutation.
+    //    The permuted ordering places rank 0's rows first, then rank 1's, etc.
+    std::vector<int> all_owned(n);
+    MPI_Allgatherv(owned_rows, local_nrows, MPI_INT,
+                   all_owned.data(), gather_counts_.data(),
+                   gather_displs_.data(), MPI_INT, comm_);
+
+    perm_.resize(n);    // perm_[new] = old  (0-based)
+    iperm_.resize(n);   // iperm_[old] = new  (0-based)
+    for (int i = 0; i < n; ++i) {
+        perm_[i] = all_owned[i] - 1;   // 1-based -> 0-based
+        iperm_[perm_[i]] = i;
+    }
+
+    // 3. Contiguous row range for this rank in the permuted ordering.
+    first_row_ = gather_displs_[rank_] + 1;            // 1-based
+    last_row_  = gather_displs_[rank_] + local_nrows;   // 1-based
+
+    // 4. Copy local CSR and remap column indices via the permutation.
+    //    Row structure (ia) is unchanged; only ja columns are remapped.
+    //    After remapping, column indices within each row are re-sorted
+    //    (PARDISO requires ascending column order).
+    if (local_nrows > 0) {
+        const int local_nnz = ia[local_nrows] - 1; // ia is 1-based
+        local_ia_.assign(ia, ia + local_nrows + 1);
+        local_ja_.resize(local_nnz);
+        local_a_.resize(local_nnz);
+
+        for (int i = 0; i < local_nrows; ++i) {
+            const int start = ia[i] - 1;       // 0-based into ja/a
+            const int end   = ia[i + 1] - 1;
+            const int row_nnz = end - start;
+
+            // Build (new_col, val) pairs.
+            struct ColVal { int col; double val; };
+            std::vector<ColVal> entries(row_nnz);
+            for (int k = 0; k < row_nnz; ++k) {
+                int old_col_0 = ja[start + k] - 1;         // 0-based
+                entries[k] = {iperm_[old_col_0] + 1, a[start + k]};
+            }
+
+            // Sort by permuted column index.
+            std::sort(entries.begin(), entries.end(),
+                      [](const ColVal& x, const ColVal& y) {
+                          return x.col < y.col;
+                      });
+
+            for (int k = 0; k < row_nnz; ++k) {
+                local_ja_[start + k] = entries[k].col;
+                local_a_[start + k]  = entries[k].val;
+            }
+        }
+    } else {
+        local_ia_.clear();
+        local_ja_.clear();
+        local_a_.clear();
+    }
 
     matrix_set_ = true;
 }
@@ -157,7 +202,7 @@ void PardisoMPI::factorize()
 }
 
 // ---------------------------------------------------------------------------
-// solve  (collective: phase 33, then allgather)
+// solve  (collective: phase 33, then allgather + inverse permute)
 // ---------------------------------------------------------------------------
 void PardisoMPI::solve(const double* rhs, double* sol)
 {
@@ -176,36 +221,42 @@ void PardisoMPI::solve(const double* rhs, double* sol)
 
     const int local_nrows = last_row_ - first_row_ + 1;
 
+    // Permute the full RHS to match the reordered matrix:
+    //   perm_rhs[new_i] = rhs[perm_[new_i]]   (= rhs[old_i])
+    std::vector<double> perm_rhs(n_);
+    for (int i = 0; i < n_; ++i)
+        perm_rhs[i] = rhs[perm_[i]];
+
+    // Extract this rank's local portion and solve.
+    std::vector<double> local_sol(local_nrows);
     if (local_nrows > 0) {
-        // Extract this rank's portion of the RHS.  Cluster PARDISO may
-        // modify the buffer, so work on a copy.
-        std::vector<double> local_rhs(rhs + (first_row_ - 1),
-                                      rhs + last_row_);
-        std::vector<double> local_sol(local_nrows);
+        std::vector<double> local_rhs(perm_rhs.begin() + (first_row_ - 1),
+                                      perm_rhs.begin() + last_row_);
 
         cluster_sparse_solver(pt_, &maxfct_, &mnum_, &mtype_, &phase,
                               &n_, a_ptr, ia_ptr, ja_ptr,
                               &idum, &nrhs, iparm_, &msglvl_,
                               local_rhs.data(), local_sol.data(),
                               &comm_fortran_, &error);
-        check_pardiso_error(error, "solve (phase 33)");
-
-        // Assemble the full solution on every rank.
-        MPI_Allgatherv(local_sol.data(), local_nrows, MPI_DOUBLE,
-                       sol, gather_counts_.data(), gather_displs_.data(),
-                       MPI_DOUBLE, comm_);
     } else {
-        // This rank owns no rows — still must participate collectively.
         cluster_sparse_solver(pt_, &maxfct_, &mnum_, &mtype_, &phase,
                               &n_, a_ptr, ia_ptr, ja_ptr,
                               &idum, &nrhs, iparm_, &msglvl_,
                               &ddum, &ddum, &comm_fortran_, &error);
-        check_pardiso_error(error, "solve (phase 33)");
-
-        MPI_Allgatherv(nullptr, 0, MPI_DOUBLE,
-                       sol, gather_counts_.data(), gather_displs_.data(),
-                       MPI_DOUBLE, comm_);
     }
+    check_pardiso_error(error, "solve (phase 33)");
+
+    // Assemble full permuted solution.
+    std::vector<double> perm_sol(n_);
+    MPI_Allgatherv(local_nrows > 0 ? local_sol.data() : nullptr,
+                   local_nrows, MPI_DOUBLE,
+                   perm_sol.data(), gather_counts_.data(),
+                   gather_displs_.data(), MPI_DOUBLE, comm_);
+
+    // Inverse-permute back to original ordering:
+    //   sol[old_i] = perm_sol[iperm_[old_i]]   (= perm_sol[new_i])
+    for (int i = 0; i < n_; ++i)
+        sol[perm_[i]] = perm_sol[i];
 }
 
 // ---------------------------------------------------------------------------

@@ -33,8 +33,14 @@ void SparseMatrixSolvePardiso::update(std::vector<Triplet> const& triplets)
     // Convert COO triplets to local 1-based CSR.
     triplets_to_csr(triplets);
 
+    // Build 1-based owned_rows for this rank's block partition.
+    int local_nrows = last_row_ - first_row_ + 1;
+    std::vector<int> owned_rows(local_nrows);
+    for (int i = 0; i < local_nrows; ++i)
+        owned_rows[i] = first_row_ + i;   // 1-based
+
     // Pass local CSR to Cluster PARDISO and factorize.
-    pardiso_.set_matrix(n_, first_row_, last_row_,
+    pardiso_.set_matrix(n_, local_nrows, owned_rows.data(),
                         ia_.data(), ja_.data(), a_.data());
     pardiso_.factorize();
 }

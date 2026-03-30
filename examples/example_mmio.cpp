@@ -73,8 +73,10 @@ int main(int argc, char* argv[])
     int remainder     = N % nprocs;
     int first_row_0   = rank * rows_per_rank + std::min(rank, remainder);
     int local_nrows   = rows_per_rank + (rank < remainder ? 1 : 0);
-    int first_row     = first_row_0 + 1;            // 1-based
-    int last_row      = first_row_0 + local_nrows;  // 1-based
+
+    std::vector<int> owned_rows(local_nrows);
+    for (int i = 0; i < local_nrows; ++i)
+        owned_rows[i] = first_row_0 + i + 1;   // 1-based
 
     int nnz_offset = A.ia[first_row_0] - 1;
     std::vector<int> local_ia(local_nrows + 1);
@@ -94,7 +96,7 @@ int main(int argc, char* argv[])
     {
         PardisoMPI solver(MPI_COMM_WORLD);
         solver.set_matrix_type(11); // real unsymmetric
-        solver.set_matrix(N, first_row, last_row,
+        solver.set_matrix(N, local_nrows, owned_rows.data(),
                           local_ia.data(),
                           A.ja.data() + nnz_offset,
                           A.a.data() + nnz_offset);

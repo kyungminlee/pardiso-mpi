@@ -10,8 +10,11 @@
 /// internally across MPI ranks.
 ///
 /// Uses **distributed assembled input** (`iparm[39] = 2`): each MPI
-/// rank provides only the rows it owns.  After a solve, the full
-/// solution is assembled on every rank via `MPI_Allgatherv`.
+/// rank provides only the rows it owns.  Rows need not be contiguous —
+/// the wrapper builds an internal permutation to map each rank's rows
+/// to a contiguous block, remaps column indices accordingly, and
+/// inverse-permutes the solution after the solve.  After a solve, the
+/// full solution is assembled on every rank via `MPI_Allgatherv`.
 ///
 /// Matrix storage follows **1-based CSR** indexing (PARDISO convention).
 class PardisoMPI {
@@ -43,18 +46,23 @@ public:
     /// Provide this rank's portion of the sparse matrix in 1-based CSR.
     ///
     /// Every rank must call this method (it is collective).  Each rank
-    /// supplies only the rows it owns.  Row ranges across all ranks must
-    /// be non-overlapping and together cover rows [1, n].
+    /// supplies only the rows it owns.  The rows need **not** be
+    /// contiguous; the wrapper internally builds a symmetric permutation
+    /// so that each rank's rows form a contiguous block for Cluster
+    /// PARDISO, and remaps column indices accordingly.
     ///
-    /// @param n          Global matrix dimension (rows = cols).
-    /// @param first_row  First row owned by this rank (1-based, inclusive).
-    /// @param last_row   Last row owned by this rank (1-based, inclusive).
-    ///                   Pass first_row > last_row if this rank owns no rows.
+    /// @param n           Global matrix dimension (rows = cols).
+    /// @param local_nrows Number of rows owned by this rank.
+    /// @param owned_rows  Array of `local_nrows` row indices owned by this
+    ///                    rank (1-based).  Across all ranks, these must be
+    ///                    non-overlapping and together cover [1, n].
     /// @param ia  Local row pointer array of size `local_nrows + 1` (1-based).
+    ///            Row i of `ia`/`ja`/`a` corresponds to global row
+    ///            `owned_rows[i]`.
     /// @param ja  Local column index array of size `ia[local_nrows] - 1`
     ///            (global 1-based column indices).
     /// @param a   Local value array, same length as `ja`.
-    void set_matrix(int n, int first_row, int last_row,
+    void set_matrix(int n, int local_nrows, const int* owned_rows,
                     const int* ia,
                     const int* ja,
                     const double* a);
@@ -95,11 +103,13 @@ private:
     // ---- Global matrix dimension ----
     int n_;                 ///< Global number of rows/columns.
 
-    // ---- Row ownership (1-based, inclusive) ----
-    int first_row_;         ///< First row owned by this rank.
-    int last_row_;          ///< Last row owned by this rank.
+    // ---- Permutation (maps non-contiguous ownership to contiguous) ----
+    int first_row_;         ///< First permuted row for this rank (1-based).
+    int last_row_;          ///< Last permuted row for this rank (1-based).
+    std::vector<int> perm_;   ///< perm_[new] = old (0-based).
+    std::vector<int> iperm_;  ///< iperm_[old] = new (0-based).
 
-    // ---- Local CSR (rows owned by this rank) ----
+    // ---- Local CSR (permuted, contiguous rows for PARDISO) ----
     std::vector<int>    local_ia_;
     std::vector<int>    local_ja_;
     std::vector<double> local_a_;
