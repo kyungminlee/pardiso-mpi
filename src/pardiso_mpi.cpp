@@ -28,6 +28,8 @@ PardisoMPI::PardisoMPI(MPI_Comm comm)
     , factorized_(false)
     , matrix_set_(false)
     , n_(0)
+    , first_row_(0)
+    , last_row_(-1)
 {
     // Duplicate communicator so the caller can safely free theirs.
     int mpi_err = MPI_Comm_dup(comm, &comm_);
@@ -63,9 +65,9 @@ void PardisoMPI::set_matrix_type(int mtype)
 }
 
 // ---------------------------------------------------------------------------
-// set_matrix — store full CSR on rank 0
+// set_matrix — each rank stores its local rows
 // ---------------------------------------------------------------------------
-void PardisoMPI::set_matrix(int n,
+void PardisoMPI::set_matrix(int n, int first_row, int last_row,
                             const int* ia,
                             const int* ja,
                             const double* a)
@@ -77,14 +79,30 @@ void PardisoMPI::set_matrix(int n,
     }
 
     n_ = n;
+    first_row_ = first_row;
+    last_row_  = last_row;
 
-    // With iparm[39]=0 (centralised input), only rank 0 needs the matrix.
-    if (rank_ == 0) {
-        const int nnz = ia[n] - 1;   // ia is 1-based: nnz = ia[n] - ia[0]
-        global_ia_.assign(ia, ia + n + 1);
-        global_ja_.assign(ja, ja + nnz);
-        global_a_.assign(a, a + nnz);
+    const int local_nrows = last_row - first_row + 1;
+
+    if (local_nrows > 0) {
+        const int local_nnz = ia[local_nrows] - 1; // ia is 1-based
+        local_ia_.assign(ia, ia + local_nrows + 1);
+        local_ja_.assign(ja, ja + local_nnz);
+        local_a_.assign(a, a + local_nnz);
+    } else {
+        local_ia_.clear();
+        local_ja_.clear();
+        local_a_.clear();
     }
+
+    // Precompute gather metadata for MPI_Allgatherv in solve().
+    gather_counts_.resize(comm_size_);
+    gather_displs_.resize(comm_size_);
+    MPI_Allgather(&local_nrows, 1, MPI_INT,
+                  gather_counts_.data(), 1, MPI_INT, comm_);
+    gather_displs_[0] = 0;
+    for (int i = 1; i < comm_size_; ++i)
+        gather_displs_[i] = gather_displs_[i - 1] + gather_counts_[i - 1];
 
     matrix_set_ = true;
 }
@@ -105,17 +123,19 @@ void PardisoMPI::factorize()
     iparm_[0]  = 1;   // Use custom values (not defaults).
     iparm_[1]  = 2;   // Nested dissection from METIS.
     iparm_[34] = 0;   // 1-based indexing.
-    iparm_[39] = 0;   // Centralised input: matrix on rank 0 only.
+    iparm_[39] = 2;   // Distributed assembled input.
+    iparm_[40] = first_row_;   // First row owned by this rank (1-based).
+    iparm_[41] = last_row_;    // Last row owned by this rank (1-based).
 
     int phase, error;
     int nrhs = 0;   // No RHS during factorization.
     int idum = 0;
     double ddum = 0.0;
 
-    // Rank 0 passes real data; other ranks pass dummy pointers.
-    double* a_ptr  = (rank_ == 0) ? global_a_.data()  : &ddum;
-    int*    ia_ptr = (rank_ == 0) ? global_ia_.data() : &idum;
-    int*    ja_ptr = (rank_ == 0) ? global_ja_.data() : &idum;
+    // Each rank passes its local data (or dummy pointers if no rows).
+    double* a_ptr  = !local_a_.empty()  ? local_a_.data()  : &ddum;
+    int*    ia_ptr = !local_ia_.empty() ? local_ia_.data() : &idum;
+    int*    ja_ptr = !local_ja_.empty() ? local_ja_.data() : &idum;
 
     // Phase 11: symbolic factorization (collective).
     phase = 11;
@@ -137,7 +157,7 @@ void PardisoMPI::factorize()
 }
 
 // ---------------------------------------------------------------------------
-// solve  (collective: phase 33, then broadcast)
+// solve  (collective: phase 33, then allgather)
 // ---------------------------------------------------------------------------
 void PardisoMPI::solve(const double* rhs, double* sol)
 {
@@ -150,28 +170,42 @@ void PardisoMPI::solve(const double* rhs, double* sol)
     int idum  = 0;
     double ddum = 0.0;
 
-    double* a_ptr  = (rank_ == 0) ? global_a_.data()  : &ddum;
-    int*    ia_ptr = (rank_ == 0) ? global_ia_.data() : &idum;
-    int*    ja_ptr = (rank_ == 0) ? global_ja_.data() : &idum;
+    double* a_ptr  = !local_a_.empty()  ? local_a_.data()  : &ddum;
+    int*    ia_ptr = !local_ia_.empty() ? local_ia_.data() : &idum;
+    int*    ja_ptr = !local_ja_.empty() ? local_ja_.data() : &idum;
 
-    if (rank_ == 0) {
-        // Cluster PARDISO may modify the RHS buffer, so work on a copy.
-        std::vector<double> rhs_copy(rhs, rhs + n_);
+    const int local_nrows = last_row_ - first_row_ + 1;
+
+    if (local_nrows > 0) {
+        // Extract this rank's portion of the RHS.  Cluster PARDISO may
+        // modify the buffer, so work on a copy.
+        std::vector<double> local_rhs(rhs + (first_row_ - 1),
+                                      rhs + last_row_);
+        std::vector<double> local_sol(local_nrows);
 
         cluster_sparse_solver(pt_, &maxfct_, &mnum_, &mtype_, &phase,
                               &n_, a_ptr, ia_ptr, ja_ptr,
                               &idum, &nrhs, iparm_, &msglvl_,
-                              rhs_copy.data(), sol, &comm_fortran_, &error);
+                              local_rhs.data(), local_sol.data(),
+                              &comm_fortran_, &error);
+        check_pardiso_error(error, "solve (phase 33)");
+
+        // Assemble the full solution on every rank.
+        MPI_Allgatherv(local_sol.data(), local_nrows, MPI_DOUBLE,
+                       sol, gather_counts_.data(), gather_displs_.data(),
+                       MPI_DOUBLE, comm_);
     } else {
+        // This rank owns no rows — still must participate collectively.
         cluster_sparse_solver(pt_, &maxfct_, &mnum_, &mtype_, &phase,
                               &n_, a_ptr, ia_ptr, ja_ptr,
                               &idum, &nrhs, iparm_, &msglvl_,
                               &ddum, &ddum, &comm_fortran_, &error);
-    }
-    check_pardiso_error(error, "solve (phase 33)");
+        check_pardiso_error(error, "solve (phase 33)");
 
-    // Broadcast the full solution to all ranks.
-    MPI_Bcast(sol, n_, MPI_DOUBLE, 0, comm_);
+        MPI_Allgatherv(nullptr, 0, MPI_DOUBLE,
+                       sol, gather_counts_.data(), gather_displs_.data(),
+                       MPI_DOUBLE, comm_);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -186,9 +220,14 @@ void PardisoMPI::pardiso_cleanup()
         int idum  = 0;
         double ddum = 0.0;
 
-        double* a_ptr  = (rank_ == 0 && !global_a_.empty())  ? global_a_.data()  : &ddum;
-        int*    ia_ptr = (rank_ == 0 && !global_ia_.empty()) ? global_ia_.data() : &idum;
-        int*    ja_ptr = (rank_ == 0 && !global_ja_.empty()) ? global_ja_.data() : &idum;
+        // Ensure distributed-input parameters are set for cleanup.
+        iparm_[39] = 2;
+        iparm_[40] = first_row_;
+        iparm_[41] = last_row_;
+
+        double* a_ptr  = !local_a_.empty()  ? local_a_.data()  : &ddum;
+        int*    ia_ptr = !local_ia_.empty() ? local_ia_.data() : &idum;
+        int*    ja_ptr = !local_ja_.empty() ? local_ja_.data() : &idum;
 
         cluster_sparse_solver(pt_, &maxfct_, &mnum_, &mtype_, &phase,
                               &n_, a_ptr, ia_ptr, ja_ptr,
@@ -198,9 +237,9 @@ void PardisoMPI::pardiso_cleanup()
     }
 
     // Clear stored data.
-    global_ia_.clear();
-    global_ja_.clear();
-    global_a_.clear();
+    local_ia_.clear();
+    local_ja_.clear();
+    local_a_.clear();
 
     // Re-zero PARDISO handles.
     std::memset(pt_, 0, sizeof(pt_));

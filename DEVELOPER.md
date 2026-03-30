@@ -23,27 +23,32 @@ handle format conversion and provide a convenient C++ interface.
 
 ## Input Model
 
-Both `PardisoMPI` and `SparseMatrixSolvePardiso` use **centralised input**
-(`iparm[39] = 0`):
+Both `PardisoMPI` and `SparseMatrixSolvePardiso` use **distributed assembled
+input** (`iparm[39] = 2`):
 
 - Every rank calls each method (all operations are **collective**).
-- Only rank 0's matrix and RHS data is read by Cluster PARDISO.
-- In practice, every rank builds the same full matrix and RHS, so the
-  same pointers can be passed on all ranks.
-- After a solve, the solution is broadcast to all ranks via `MPI_Bcast`.
+- Each rank provides only the matrix rows it owns via `set_matrix()`.
+  Row ownership is specified by `first_row` / `last_row` (1-based).
+- `iparm[40]` and `iparm[41]` tell Cluster PARDISO each rank's row range.
+- Every rank must supply the full global RHS to `solve()`.
+- After a solve, the solution is assembled on every rank via
+  `MPI_Allgatherv`.
 
 ## Data Flow: `PardisoMPI`
 
-### `set_matrix(n, ia, ja, a)`
+### `set_matrix(n, first_row, last_row, ia, ja, a)`
 
-Collective.  Stores the full 1-based CSR matrix on rank 0.
+Collective.  Each rank stores its local rows in 1-based CSR.
 
 ```
-rank 0: global_ia_ = ia, global_ja_ = ja, global_a_ = a
-other ranks: no data stored
+Each rank stores:
+  local_ia_ = ia  (size: local_nrows + 1, 1-based)
+  local_ja_ = ja  (global 1-based column indices)
+  local_a_  = a   (values for local rows)
 ```
 
-No MPI communication occurs.
+One `MPI_Allgather` exchanges the local row counts to precompute
+gather metadata used by `solve()`.
 
 ### `factorize()`  — Cluster PARDISO phases 11 + 22
 
@@ -54,8 +59,8 @@ All ranks call:
     cluster_sparse_solver(phase=11)   — symbolic factorization
     cluster_sparse_solver(phase=22)   — numerical factorization
 
-Rank 0 passes global_ia_, global_ja_, global_a_.
-Other ranks pass dummy pointers.
+Each rank passes its local_ia_, local_ja_, local_a_.
+iparm[39]=2, iparm[40]=first_row, iparm[41]=last_row.
 ```
 
 Internally, Cluster PARDISO distributes the work (reordering, LU factors)
@@ -66,14 +71,13 @@ across all ranks using MPI.
 Collective.  All ranks participate in the distributed solve.
 
 ```
-All ranks call:
+Each rank extracts its local portion of the RHS and calls:
     cluster_sparse_solver(phase=33)   — forward/backward substitution
 
-Rank 0 passes the global RHS and receives the global solution.
-Other ranks pass dummy pointers.
+Each rank receives its local portion of the solution.
 
 Then:
-    MPI_Bcast(sol, n, MPI_DOUBLE, 0, comm)
+    MPI_Allgatherv(local_sol -> sol)
 
 Every rank now has the full solution.
 ```
@@ -114,15 +118,16 @@ global RHS vector.
 
 | Operation          | MPI Calls                                         | Direction     |
 |--------------------|---------------------------------------------------|---------------|
-| `set_matrix`       | None                                              | —             |
+| `set_matrix`       | `MPI_Allgather` (gather metadata for solve)       | all → all     |
 | `factorize`        | Internal to Cluster PARDISO (phases 11 + 22)      | all ↔ all     |
-| `solve`            | Internal to Cluster PARDISO (phase 33) + `MPI_Bcast` | all ↔ all  |
+| `solve`            | Internal to Cluster PARDISO (phase 33) + `MPI_Allgatherv` | all ↔ all  |
 | `pardiso_cleanup`  | Internal to Cluster PARDISO (phase -1)            | all ↔ all     |
 
 All operations are **collective** — every rank in the communicator must
 participate.  The internal MPI communication is managed entirely by
-Cluster PARDISO; the only explicit MPI call in the wrapper is the
-`MPI_Bcast` after the solve to ensure every rank has the full solution.
+Cluster PARDISO; the explicit MPI calls in the wrapper are
+`MPI_Allgather` in `set_matrix` (to exchange row counts) and
+`MPI_Allgatherv` after the solve (to assemble the full solution).
 
 ## Sequence Diagram (PlantUML)
 
@@ -137,10 +142,10 @@ participant "Caller"              as C
 participant "All MPI Ranks"       as R
 participant "Cluster PARDISO\n(MKL internal)" as P
 
-== set_matrix(n, ia, ja, a) ==
+== set_matrix(n, first_row, last_row, ia, ja, a) ==
 
 C -> R : set_matrix()
-R -> R : Rank 0 stores full CSR\n(no communication)
+R -> R : Each rank stores local CSR\n+ MPI_Allgather(counts)
 
 == factorize() ==
 
@@ -153,9 +158,9 @@ R <-- P : distributed L/U factors
 == solve(rhs, sol) ==
 
 C -> R : solve()
-R -> P : cluster_sparse_solver(phase=33)\n[solve — all ranks]
-R <-- P : solution on rank 0
-R -> R : MPI_Bcast(sol)
+R -> P : cluster_sparse_solver(phase=33)\n[solve — all ranks, local RHS]
+R <-- P : local solution on each rank
+R -> R : MPI_Allgatherv(sol)
 
 note over R
   Every rank now has
@@ -186,9 +191,9 @@ participant "Cluster PARDISO"     as P
 
 C -> S : update(triplets)
 
-S -> S : triplets_to_csr():\n1. Sort by (row, col)\n2. Sum duplicates\n3. Build 1-based CSR
+S -> S : triplets_to_csr():\n1. Filter to local rows\n2. Sort by (row, col)\n3. Sum duplicates\n4. Build local 1-based CSR
 
-S -> PM : set_matrix(n, ia, ja, a)
+S -> PM : set_matrix(n, first_row, last_row, ia, ja, a)
 S -> PM : factorize()
 PM -> P : phase 11 + 22 (distributed)
 
@@ -197,7 +202,7 @@ PM -> P : phase 11 + 22 (distributed)
 C -> S : solve(rhs, sol)
 S -> PM : solve(rhs, sol)
 PM -> P : phase 33 (distributed)
-PM -> PM : MPI_Bcast(sol)
+PM -> PM : MPI_Allgatherv(sol)
 
 S --> C : sol[] filled on every rank
 
@@ -211,7 +216,9 @@ S --> C : sol[] filled on every rank
 | `iparm[0]`  | 1     | Use custom parameter values |
 | `iparm[1]`  | 2     | Nested dissection reordering (METIS) |
 | `iparm[34]` | 0     | 1-based indexing |
-| `iparm[39]` | 0     | Centralised matrix input (rank 0 only) |
+| `iparm[39]` | 2     | Distributed assembled matrix input |
+| `iparm[40]` | varies | First row owned by this rank (1-based) |
+| `iparm[41]` | varies | Last row owned by this rank (1-based) |
 
 ## Linking
 
@@ -227,15 +234,16 @@ The CMakeLists.txt handles both cases.
 
 ## Limitations and Design Choices
 
-- **Centralised input**: Every rank builds the full matrix and RHS.
-  For very large matrices this may be memory-inefficient; Cluster PARDISO
-  also supports distributed input (`iparm[39] = 1`) where each rank
-  provides only its block of rows, but this wrapper does not currently
-  expose that mode.
+- **Distributed input**: Each rank provides only its block of rows
+  (`iparm[39] = 2`).  This is memory-efficient for large matrices since
+  no single rank needs to store the full CSR.  Row partitioning is the
+  caller's responsibility for `PardisoMPI`; `SparseMatrixSolvePardiso`
+  handles it automatically with a simple block distribution.
 
-- **Broadcast after solve**: With `iparm[39] = 0`, only rank 0 receives
-  the solution from Cluster PARDISO.  The wrapper broadcasts it so that
-  every rank has the full result, matching the caller's expectation.
+- **Allgather after solve**: With distributed input, each rank receives
+  only its local portion of the solution from Cluster PARDISO.  The
+  wrapper uses `MPI_Allgatherv` so that every rank has the full result,
+  matching the caller's expectation.
 
 - **1-based indexing**: PARDISO requires 1-based CSR.  All internal storage
   uses 1-based indexing.  `SparseMatrixSolvePardiso` accepts 0-based triplets

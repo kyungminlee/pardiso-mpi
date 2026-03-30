@@ -9,10 +9,9 @@
 /// in the communicator must call them.  The solver distributes work
 /// internally across MPI ranks.
 ///
-/// With the default `iparm[39] = 0` (centralised input), only rank 0
-/// needs to supply the matrix and RHS data; other ranks may pass dummy
-/// pointers.  After a solve, the solution is broadcast so that every
-/// rank holds the full result.
+/// Uses **distributed assembled input** (`iparm[39] = 2`): each MPI
+/// rank provides only the rows it owns.  After a solve, the full
+/// solution is assembled on every rank via `MPI_Allgatherv`.
 ///
 /// Matrix storage follows **1-based CSR** indexing (PARDISO convention).
 class PardisoMPI {
@@ -41,16 +40,21 @@ public:
     ///   * 11 – real unsymmetric (default)
     void set_matrix_type(int mtype);
 
-    /// Provide the full global sparse matrix in 1-based CSR format.
+    /// Provide this rank's portion of the sparse matrix in 1-based CSR.
     ///
-    /// Every rank must call this method (it is collective).  Only
-    /// rank 0's data is read; other ranks may pass any valid pointers.
+    /// Every rank must call this method (it is collective).  Each rank
+    /// supplies only the rows it owns.  Row ranges across all ranks must
+    /// be non-overlapping and together cover rows [1, n].
     ///
-    /// @param n   Global matrix dimension (rows = cols).
-    /// @param ia  Row pointer array of size `n + 1` (1-based).
-    /// @param ja  Column index array of size `ia[n] - 1` (1-based).
-    /// @param a   Value array, same length as `ja`.
-    void set_matrix(int n,
+    /// @param n          Global matrix dimension (rows = cols).
+    /// @param first_row  First row owned by this rank (1-based, inclusive).
+    /// @param last_row   Last row owned by this rank (1-based, inclusive).
+    ///                   Pass first_row > last_row if this rank owns no rows.
+    /// @param ia  Local row pointer array of size `local_nrows + 1` (1-based).
+    /// @param ja  Local column index array of size `ia[local_nrows] - 1`
+    ///            (global 1-based column indices).
+    /// @param a   Local value array, same length as `ja`.
+    void set_matrix(int n, int first_row, int last_row,
                     const int* ia,
                     const int* ja,
                     const double* a);
@@ -63,10 +67,11 @@ public:
     /// Solve A x = rhs.
     ///
     /// Collective — every rank must call this.
-    /// Rank 0 must supply the global RHS of size n.  On return, every
-    /// rank holds the full global solution of size n (via MPI_Bcast).
+    /// Every rank must supply the full global RHS of size n.  On return,
+    /// every rank holds the full global solution of size n (via
+    /// MPI_Allgatherv).
     ///
-    /// @param rhs  Global RHS vector of size n (used on rank 0).
+    /// @param rhs  Global RHS vector of size n.
     /// @param sol  On return, the global solution of size n on every rank.
     void solve(const double* rhs, double* sol);
 
@@ -90,10 +95,18 @@ private:
     // ---- Global matrix dimension ----
     int n_;                 ///< Global number of rows/columns.
 
-    // ---- Global CSR (rank 0 only) ----
-    std::vector<int>    global_ia_;
-    std::vector<int>    global_ja_;
-    std::vector<double> global_a_;
+    // ---- Row ownership (1-based, inclusive) ----
+    int first_row_;         ///< First row owned by this rank.
+    int last_row_;          ///< Last row owned by this rank.
+
+    // ---- Local CSR (rows owned by this rank) ----
+    std::vector<int>    local_ia_;
+    std::vector<int>    local_ja_;
+    std::vector<double> local_a_;
+
+    // ---- Gather metadata for MPI_Allgatherv in solve ----
+    std::vector<int> gather_counts_;  ///< local_nrows per rank.
+    std::vector<int> gather_displs_;  ///< Displacement per rank.
 
     /// Release Cluster PARDISO internal memory (phase -1).
     /// Collective — all ranks must participate.
