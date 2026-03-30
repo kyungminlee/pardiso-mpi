@@ -72,6 +72,34 @@ public:
     ///                  (same size and ordering as @p rhs).
     void solve(const double* rhs, double* solution);
 
+    /// Provide the full global sparse matrix in 1-based CSR format.
+    ///
+    /// Unlike set_matrix(), this method does **not** partition rows across
+    /// ranks.  Every rank must call this with the same (identical) matrix
+    /// data; only rank 0's copy is actually stored.  Subsequent calls to
+    /// factorize() will skip the gather step.
+    ///
+    /// @param n   Global matrix dimension.
+    /// @param ia  Row pointer array of size `n + 1` (1-based).
+    /// @param ja  Column index array of size `ia[n] - 1` (1-based).
+    /// @param a   Value array, same length as `ja`.
+    void set_global_matrix(int n,
+                           const int* ia,
+                           const int* ja,
+                           const double* a);
+
+    /// Solve A x = rhs when the full RHS is available on every rank.
+    ///
+    /// Unlike solve(), both input and output are **global** vectors of
+    /// size `n`.  Rank 0 performs the PARDISO phase-33 call and the
+    /// solution is broadcast to all ranks via MPI_Bcast.
+    ///
+    /// @param global_rhs  Global right-hand side of size `n` (read on
+    ///                    rank 0, ignored on other ranks).
+    /// @param global_sol  On return, the global solution of size `n`
+    ///                    on every rank.
+    void solve_global(const double* global_rhs, double* global_sol);
+
 private:
     // ---- MPI state ----
     MPI_Comm comm_;
@@ -87,6 +115,7 @@ private:
     int   msglvl_;          ///< Message level (0 = no output).
     bool  factorized_;      ///< True after successful factorize().
     bool  matrix_set_;      ///< True after successful set_matrix().
+    bool  global_mode_;     ///< True when set_global_matrix() was used.
 
     // ---- Global matrix dimension ----
     int n_;                 ///< Global number of rows/columns.

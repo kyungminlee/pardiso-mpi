@@ -164,41 +164,34 @@ their gathered data buffers and zero the PARDISO handle array.
 
 This is a higher-level wrapper that sits on top of `PardisoMPI`.  It accepts
 COO triplets instead of pre-built CSR, and its `solve()` returns the **full
-global** solution on every rank (not just the local portion).
+global** solution on every rank.
+
+Every rank must supply the **same** complete set of triplets and the **same**
+global RHS vector.  Because the full data is already available on every rank,
+no per-rank distribution or gather/scatter is needed — rank 0 uses the data
+directly and broadcasts the result.
 
 ### `update(triplets, rowToRank)`
 
 ```
-1. Store rowToRank, determine local_rows_ (same logic as PardisoMPI)
-2. triplets_to_csr(triplets):
+1. triplets_to_csr(triplets):
      - Sort all triplets by (row, col)
      - Merge duplicates: entries with same (row,col) have values summed
      - Build 1-based CSR arrays ia_, ja_, a_
-3. pardiso_.set_matrix(n, ia, ja, a, row_to_rank)   // extracts local rows
-4. pardiso_.factorize()                              // gather + factor on rank 0
+2. pardiso_.set_global_matrix(n, ia, ja, a)   // rank 0 stores full CSR
+3. pardiso_.factorize()                       // rank 0 factorizes (no gather)
 ```
 
-The full CSR (all rows) is passed to `PardisoMPI::set_matrix` -- each rank
-internally extracts only its owned rows.
+The `rowToRank` parameter is retained for API compatibility but is unused.
 
 ### `solve(rhs, sol)`
 
-The caller passes **global** arrays of size `n` on every rank.
+The caller passes **global** arrays of size `n` (identical on every rank).
 
 ```
-1. Extract local RHS:
-     local_rhs_[li] = rhs[local_rows_[li]]
-
-2. pardiso_.solve(local_rhs_, local_sol_)
-     (internally: gather local RHS -> rank 0 solves -> scatter local solution)
-
-3. Allgatherv to give every rank the full solution:
-     MPI_Allgather:   local_n     -> counts[comm_size]
-     MPI_Allgatherv:  local_rows_ -> all_rows         (row indices)
-     MPI_Allgatherv:  local_sol_  -> all_vals          (solution values)
-
-4. Reconstruct global solution on every rank:
-     sol[all_rows[k]] = all_vals[k]   for all k
+1. pardiso_.solve_global(rhs, sol)
+     - Rank 0 calls PARDISO phase 33 with the full RHS
+     - MPI_Bcast sends the full solution to all ranks
 ```
 
 ## Communication Summary
@@ -206,11 +199,13 @@ The caller passes **global** arrays of size `n` on every rank.
 | Operation                  | MPI Calls                                    | Direction         |
 |----------------------------|----------------------------------------------|-------------------|
 | `set_matrix`               | None (local extraction only)                 | --                |
+| `set_global_matrix`        | None (rank 0 stores full CSR)                | --                |
 | `factorize` / `gather_matrix` | 2x `MPI_Gather` + 4x `MPI_Gatherv` + `MPI_Barrier` | all -> rank 0  |
+| `factorize` (global mode)  | `MPI_Barrier` only                           | --                |
 | `solve` / `gather_rhs`    | 1x `MPI_Gather` + 2x `MPI_Gatherv`          | all -> rank 0     |
 | `solve` / PARDISO phase 33| None (rank 0 only)                           | --                |
 | `solve` / `scatter_solution`| 1x `MPI_Gather` + 1x `MPI_Gatherv` + 1x `MPI_Scatterv` | rank 0 -> all |
-| `SparseMatrixSolvePardiso::solve` (extra) | 1x `MPI_Allgather` + 2x `MPI_Allgatherv` | all <-> all |
+| `solve_global`             | 1x `MPI_Bcast`                               | rank 0 -> all     |
 
 ## Sequence Diagrams (PlantUML)
 
@@ -318,34 +313,20 @@ C -> S : update(triplets, rowToRank)
 
 S -> S : triplets_to_csr():\n1. Sort by (row, col)\n2. Sum duplicates\n3. Build 1-based CSR
 
-S -> PM : set_matrix(n, ia, ja, a, row_to_rank)
-note right : Each rank extracts local rows\n(no communication)
+S -> PM : set_global_matrix(n, ia, ja, a)
+note right : Rank 0 stores full CSR directly\n(no communication)
 
 S -> PM : factorize()
-PM -> R0 : gather_matrix()\n[6x MPI_Gather/Gatherv]
-R0 -> R0 : Rebuild global CSR
 R0 -> R0 : PARDISO phase 11 + 22
 PM <-- R0 : MPI_Barrier
 
-== solve(rhs, sol) — global arrays on all ranks ==
+== solve(rhs, sol) — identical global arrays on all ranks ==
 
 C -> S : solve(rhs, sol)
 
-S -> S : Extract local_rhs from\nglobal rhs using local_rows_
-
-S -> PM : solve(local_rhs, local_sol)
-PM -> R0 : gather_rhs()\n[3x MPI_Gather/Gatherv]
+S -> PM : solve_global(rhs, sol)
 R0 -> R0 : PARDISO phase 33
-R0 -> PM : scatter_solution()\n[MPI_Gatherv + MPI_Scatterv]
-S <-- PM : local_sol (per-rank portion)
-
-group Allgatherv [Broadcast full solution to all ranks]
-  S -> S : MPI_Allgather(local_n)
-  S -> S : MPI_Allgatherv(local_rows_)
-  S -> S : MPI_Allgatherv(local_sol_)
-end
-
-S -> S : Reconstruct global sol:\nsol[all_rows[k]] = all_vals[k]
+R0 -> PM : MPI_Bcast(sol)
 
 S --> C : sol[] filled on every rank
 

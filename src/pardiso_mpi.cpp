@@ -30,6 +30,7 @@ PardisoMPI::PardisoMPI(MPI_Comm comm)
     , msglvl_(0)
     , factorized_(false)
     , matrix_set_(false)
+    , global_mode_(false)
     , n_(0)
 {
     // Duplicate communicator so the caller can safely free theirs.
@@ -78,6 +79,7 @@ void PardisoMPI::set_matrix(int n,
     }
 
     n_ = n;
+    global_mode_ = false;
 
     // ----------------------------------------------------------------
     // 1.  Determine which global rows this rank owns.
@@ -120,6 +122,38 @@ void PardisoMPI::set_matrix(int n,
 }
 
 // ---------------------------------------------------------------------------
+// set_global_matrix — store full CSR directly on rank 0
+// ---------------------------------------------------------------------------
+void PardisoMPI::set_global_matrix(int n,
+                                   const int* ia,
+                                   const int* ja,
+                                   const double* a)
+{
+    if (factorized_) {
+        pardiso_cleanup();
+        factorized_ = false;
+    }
+
+    n_ = n;
+    global_mode_ = true;
+
+    // Clear distributed-mode data (not used in global mode).
+    local_rows_.clear();
+    local_ia_.clear();
+    local_ja_.clear();
+    local_a_.clear();
+
+    if (rank_ == 0) {
+        const int nnz = ia[n] - 1;   // ia is 1-based: nnz = ia[n] - ia[0]
+        global_ia_.assign(ia, ia + n + 1);
+        global_ja_.assign(ja, ja + nnz);
+        global_a_.assign(a, a + nnz);
+    }
+
+    matrix_set_ = true;
+}
+
+// ---------------------------------------------------------------------------
 // factorize  (phases 11 + 22 on rank 0)
 // ---------------------------------------------------------------------------
 void PardisoMPI::factorize()
@@ -127,8 +161,9 @@ void PardisoMPI::factorize()
     if (!matrix_set_)
         throw std::runtime_error("factorize() called before set_matrix()");
 
-    // Gather the full matrix onto rank 0.
-    gather_matrix();
+    // In global mode the full CSR is already on rank 0; skip the gather.
+    if (!global_mode_)
+        gather_matrix();
 
     // ----- rank 0: initialise PARDISO and run phases 11 + 22 -----
     if (rank_ == 0) {
@@ -203,6 +238,34 @@ void PardisoMPI::solve(const double* rhs, double* solution)
 
     // 2. Scatter the global solution back to each rank.
     scatter_solution(rank_ == 0 ? global_sol.data() : nullptr, solution);
+}
+
+// ---------------------------------------------------------------------------
+// solve_global  (phase 33 on rank 0, then broadcast)
+// ---------------------------------------------------------------------------
+void PardisoMPI::solve_global(const double* global_rhs, double* global_sol)
+{
+    if (!factorized_)
+        throw std::runtime_error("solve_global() called before factorize()");
+
+    if (rank_ == 0) {
+        // PARDISO may modify the RHS buffer, so work on a copy.
+        std::vector<double> rhs_copy(global_rhs, global_rhs + n_);
+
+        int phase = 33;
+        int nrhs  = 1;
+        int error = 0;
+        int idum  = 0;
+
+        pardiso(pt_, &maxfct_, &mnum_, &mtype_, &phase,
+                &n_, global_a_.data(), global_ia_.data(), global_ja_.data(),
+                &idum, &nrhs, iparm_, &msglvl_,
+                rhs_copy.data(), global_sol, &error);
+        check_pardiso_error(error, "solve (phase 33)");
+    }
+
+    // Broadcast the full solution to all ranks.
+    MPI_Bcast(global_sol, n_, MPI_DOUBLE, 0, comm_);
 }
 
 // ===================================================================

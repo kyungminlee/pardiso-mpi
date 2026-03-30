@@ -9,11 +9,8 @@
 SparseMatrixSolvePardiso::SparseMatrixSolvePardiso(MPI_Comm comm, int n,
                                                    int mtype)
     : n_(n)
-    , comm_(comm)
     , pardiso_(comm)
 {
-    MPI_Comm_rank(comm_, &rank_);
-    MPI_Comm_size(comm_, &comm_size_);
     pardiso_.set_matrix_type(mtype);
 }
 
@@ -21,76 +18,25 @@ SparseMatrixSolvePardiso::SparseMatrixSolvePardiso(MPI_Comm comm, int n,
 // update — convert triplets to CSR, set matrix, factorize
 // ---------------------------------------------------------------------------
 void SparseMatrixSolvePardiso::update(std::vector<Triplet> const& triplets,
-                                      std::vector<int> const& rowToRank)
+                                      std::vector<int> const& /*rowToRank*/)
 {
-    if (static_cast<int>(rowToRank.size()) != n_)
-        throw std::runtime_error(
-            "SparseMatrixSolvePardiso::update: rowToRank.size() != n");
-
-    row_to_rank_ = rowToRank;
-
-    // Determine local rows.
-    local_rows_.clear();
-    for (int i = 0; i < n_; ++i) {
-        if (row_to_rank_[i] == rank_)
-            local_rows_.push_back(i);
-    }
-
-    // Resize local buffers.
-    local_rhs_.resize(local_rows_.size());
-    local_sol_.resize(local_rows_.size());
-
     // Convert COO triplets to 1-based CSR.
     triplets_to_csr(triplets);
 
-    // Feed into PardisoMPI and factorize.
-    pardiso_.set_matrix(n_, ia_.data(), ja_.data(), a_.data(),
-                        row_to_rank_.data());
+    // Every rank has the full CSR; pass it directly to rank 0 for
+    // factorization — no per-rank distribution needed.
+    pardiso_.set_global_matrix(n_, ia_.data(), ja_.data(), a_.data());
     pardiso_.factorize();
 }
 
 // ---------------------------------------------------------------------------
-// solve — extract local RHS, call PardisoMPI, scatter back to global sol
+// solve — rank 0 solves, broadcast result to all ranks
 // ---------------------------------------------------------------------------
 void SparseMatrixSolvePardiso::solve(double* rhs, double* sol)
 {
-    const int local_n = static_cast<int>(local_rows_.size());
-
-    // Extract local portion of RHS.
-    for (int li = 0; li < local_n; ++li) {
-        local_rhs_[li] = rhs[local_rows_[li]];
-    }
-
-    // Solve (local RHS in, local solution out).
-    pardiso_.solve(local_rhs_.data(), local_sol_.data());
-
-    // Gather the full solution on all ranks via Allgatherv.
-    // First collect counts from every rank.
-    std::vector<int> counts(comm_size_);
-    std::vector<int> displs(comm_size_);
-    MPI_Allgather(&local_n, 1, MPI_INT, counts.data(), 1, MPI_INT, comm_);
-
-    displs[0] = 0;
-    for (int r = 1; r < comm_size_; ++r)
-        displs[r] = displs[r - 1] + counts[r - 1];
-
-    // Gather local row indices so every rank can reconstruct the mapping.
-    int total = displs.back() + counts.back();
-    std::vector<int> all_rows(total);
-    MPI_Allgatherv(local_rows_.data(), local_n, MPI_INT,
-                   all_rows.data(), counts.data(), displs.data(),
-                   MPI_INT, comm_);
-
-    // Gather local solution values.
-    std::vector<double> all_vals(total);
-    MPI_Allgatherv(local_sol_.data(), local_n, MPI_DOUBLE,
-                   all_vals.data(), counts.data(), displs.data(),
-                   MPI_DOUBLE, comm_);
-
-    // Scatter into the global solution vector.
-    for (int k = 0; k < total; ++k) {
-        sol[all_rows[k]] = all_vals[k];
-    }
+    // Every rank has the full global RHS.  Rank 0 solves and the
+    // result is broadcast to all ranks — no gather/scatter needed.
+    pardiso_.solve_global(rhs, sol);
 }
 
 // ---------------------------------------------------------------------------

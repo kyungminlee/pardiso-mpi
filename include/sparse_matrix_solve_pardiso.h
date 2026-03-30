@@ -13,15 +13,14 @@ struct Triplet {
 
 /// High-level MPI-parallel sparse solver wrapper around PardisoMPI.
 ///
+/// Every rank must supply the **same** complete matrix (via triplets) and
+/// the **same** complete RHS vector.  Rank 0 performs the PARDISO
+/// factorization and solve; the solution is broadcast to all ranks.
+///
 /// Usage:
 ///   SparseMatrixSolvePardiso solver(MPI_COMM_WORLD, n);
-///   solver.update(triplets, rowToRank);   // provide matrix + ownership
+///   solver.update(triplets, rowToRank);   // provide matrix, factorize
 ///   solver.solve(rhs, sol);               // solve A*sol = rhs
-///
-/// The `rhs` pointer passed to solve() points to the *global* RHS vector
-/// (size n) and may be used as scratch space.  `sol` receives the global
-/// solution (size n).  Both arrays must be allocated by the caller but the
-/// class manages all internal communication buffers.
 class SparseMatrixSolvePardiso {
 public:
     /// @param comm   MPI communicator.
@@ -39,44 +38,32 @@ public:
 
     /// Set (or replace) the sparse matrix from COO triplets and re-factorize.
     ///
-    /// @param triplets   Triplets with 0-based row/col indices.  Duplicates
-    ///                   for the same (row, col) are summed.  Each rank may
-    ///                   provide the full set of triplets or only those for
-    ///                   its own rows — non-local rows are ignored.
-    /// @param rowToRank  Array of size n.  `rowToRank[i]` is the MPI rank
-    ///                   that owns global row `i`.
+    /// Every rank must supply the **same** complete set of triplets.
+    /// Triplets with duplicate (row, col) pairs are summed.
+    ///
+    /// @param triplets   Triplets with 0-based row/col indices.
+    /// @param rowToRank  Unused — retained for API compatibility.
     void update(std::vector<Triplet> const& triplets,
                 std::vector<int> const& rowToRank);
 
     /// Solve A x = rhs.
     ///
-    /// @param rhs  Global RHS vector of size n.  Each rank must supply all n
-    ///             entries (or at minimum the entries for its local rows).
-    ///             May be used as a scratch buffer and modified on return.
+    /// Every rank must supply the **same** global RHS vector of size n.
+    /// On return, every rank receives the full global solution.
+    ///
+    /// @param rhs  Global RHS vector of size n (read-only on non-root ranks;
+    ///             may be used as scratch on rank 0).
     /// @param sol  On return, the global solution vector of size n.
-    ///             All ranks receive the full solution.
     void solve(double* rhs, double* sol);
 
 private:
     int n_;
-    MPI_Comm comm_;
-    int rank_;
-    int comm_size_;
-
     PardisoMPI pardiso_;
 
-    // Owned CSR storage (1-based, PARDISO convention).
+    // Full CSR storage (1-based, PARDISO convention).
     std::vector<int>    ia_;
     std::vector<int>    ja_;
     std::vector<double> a_;
-
-    // Row ownership.
-    std::vector<int> row_to_rank_;
-    std::vector<int> local_rows_;
-
-    // Buffers reused across solve() calls.
-    std::vector<double> local_rhs_;
-    std::vector<double> local_sol_;
 
     /// Convert triplets to 1-based CSR, summing duplicates.
     void triplets_to_csr(std::vector<Triplet> const& triplets);
