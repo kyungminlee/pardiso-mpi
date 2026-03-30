@@ -41,20 +41,6 @@ int main(int argc, char* argv[])
         if (gy < NY - 1) triplets.push_back({i, i + NX, -1.0});
     }
 
-    // Distribute rows evenly across ranks.
-    std::vector<int> rowToRank(N);
-    {
-        int rows_per = N / nprocs;
-        int rem      = N % nprocs;
-        int off = 0;
-        for (int r = 0; r < nprocs; ++r) {
-            int cnt = rows_per + (r < rem ? 1 : 0);
-            for (int j = 0; j < cnt; ++j)
-                rowToRank[off + j] = r;
-            off += cnt;
-        }
-    }
-
     // Build RHS: b = A * x_exact with x_exact = [1, ..., 1].
     std::vector<double> rhs(N, 0.0);
     for (auto const& t : triplets)
@@ -64,7 +50,7 @@ int main(int argc, char* argv[])
     std::vector<double> sol(N, 0.0);
     {
         SparseMatrixSolvePardiso solver(MPI_COMM_WORLD, N);
-        solver.update(triplets, rowToRank);
+        solver.update(triplets);
         solver.solve(rhs.data(), sol.data());
     }
 

@@ -14,12 +14,13 @@ struct Triplet {
 /// High-level MPI-parallel sparse solver wrapper around PardisoMPI.
 ///
 /// Every rank must supply the **same** complete matrix (via triplets) and
-/// the **same** complete RHS vector.  Rank 0 performs the PARDISO
-/// factorization and solve; the solution is broadcast to all ranks.
+/// the **same** complete RHS vector.  Cluster PARDISO distributes the
+/// factorization and solve work across all MPI ranks internally.
+/// The solution is broadcast so every rank holds the full result.
 ///
 /// Usage:
 ///   SparseMatrixSolvePardiso solver(MPI_COMM_WORLD, n);
-///   solver.update(triplets, rowToRank);   // provide matrix, factorize
+///   solver.update(triplets);              // provide matrix, factorize
 ///   solver.solve(rhs, sol);               // solve A*sol = rhs
 class SparseMatrixSolvePardiso {
 public:
@@ -38,21 +39,20 @@ public:
 
     /// Set (or replace) the sparse matrix from COO triplets and re-factorize.
     ///
-    /// Every rank must supply the **same** complete set of triplets.
+    /// Collective — every rank must call this with the **same** triplets.
     /// Triplets with duplicate (row, col) pairs are summed.
     ///
-    /// @param triplets   Triplets with 0-based row/col indices.
-    /// @param rowToRank  Unused — retained for API compatibility.
-    void update(std::vector<Triplet> const& triplets,
-                std::vector<int> const& rowToRank);
+    /// @param triplets  Triplets with 0-based row/col indices.
+    void update(std::vector<Triplet> const& triplets);
 
     /// Solve A x = rhs.
     ///
-    /// Every rank must supply the **same** global RHS vector of size n.
-    /// On return, every rank receives the full global solution.
+    /// Collective — every rank must call this with the **same** global
+    /// RHS vector of size n.  On return, every rank receives the full
+    /// global solution.
     ///
-    /// @param rhs  Global RHS vector of size n (read-only on non-root ranks;
-    ///             may be used as scratch on rank 0).
+    /// @param rhs  Global RHS vector of size n (may be used as scratch
+    ///             on rank 0).
     /// @param sol  On return, the global solution vector of size n.
     void solve(double* rhs, double* sol);
 

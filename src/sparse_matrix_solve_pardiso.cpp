@@ -17,26 +17,22 @@ SparseMatrixSolvePardiso::SparseMatrixSolvePardiso(MPI_Comm comm, int n,
 // ---------------------------------------------------------------------------
 // update — convert triplets to CSR, set matrix, factorize
 // ---------------------------------------------------------------------------
-void SparseMatrixSolvePardiso::update(std::vector<Triplet> const& triplets,
-                                      std::vector<int> const& /*rowToRank*/)
+void SparseMatrixSolvePardiso::update(std::vector<Triplet> const& triplets)
 {
     // Convert COO triplets to 1-based CSR.
     triplets_to_csr(triplets);
 
-    // Every rank has the full CSR; pass it directly to rank 0 for
-    // factorization — no per-rank distribution needed.
-    pardiso_.set_global_matrix(n_, ia_.data(), ja_.data(), a_.data());
+    // Pass the full CSR to Cluster PARDISO and factorize.
+    pardiso_.set_matrix(n_, ia_.data(), ja_.data(), a_.data());
     pardiso_.factorize();
 }
 
 // ---------------------------------------------------------------------------
-// solve — rank 0 solves, broadcast result to all ranks
+// solve — Cluster PARDISO phase 33, broadcast result to all ranks
 // ---------------------------------------------------------------------------
 void SparseMatrixSolvePardiso::solve(double* rhs, double* sol)
 {
-    // Every rank has the full global RHS.  Rank 0 solves and the
-    // result is broadcast to all ranks — no gather/scatter needed.
-    pardiso_.solve_global(rhs, sol);
+    pardiso_.solve(rhs, sol);
 }
 
 // ---------------------------------------------------------------------------

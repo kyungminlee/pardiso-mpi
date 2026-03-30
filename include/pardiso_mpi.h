@@ -2,18 +2,19 @@
 
 #include <mpi.h>
 #include <vector>
-#include <cstdint>
 
-/// @brief MPI-aware wrapper around Intel MKL PARDISO.
+/// @brief MPI wrapper around Intel MKL Cluster PARDISO.
 ///
-/// Each MPI rank owns a subset of rows defined by a user-supplied
-/// `row_to_rank` mapping.  During factorization and solve, rank 0
-/// gathers the full CSR matrix and right-hand side, calls PARDISO
-/// locally, and scatters the solution back to the owning ranks.
+/// All phases (factorization and solve) are **collective** — every rank
+/// in the communicator must call them.  The solver distributes work
+/// internally across MPI ranks.
+///
+/// With the default `iparm[39] = 0` (centralised input), only rank 0
+/// needs to supply the matrix and RHS data; other ranks may pass dummy
+/// pointers.  After a solve, the solution is broadcast so that every
+/// rank holds the full result.
 ///
 /// Matrix storage follows **1-based CSR** indexing (PARDISO convention).
-/// The arrays `ia`, `ja` supplied to `set_matrix` must therefore use
-/// Fortran-style 1-based indices.
 class PardisoMPI {
 public:
     /// Construct a solver bound to the given MPI communicator.
@@ -40,69 +41,39 @@ public:
     ///   * 11 – real unsymmetric (default)
     void set_matrix_type(int mtype);
 
-    /// Provide the global sparse matrix in 1-based CSR format together
-    /// with the row-to-rank ownership map.
-    ///
-    /// @param n            Global matrix dimension (number of rows/columns).
-    /// @param ia           Row pointer array of size `n + 1` (1-based).
-    /// @param ja           Column index array of size `ia[n] - 1` (1-based).
-    /// @param a            Value array, same length as `ja`.
-    /// @param row_to_rank  Array of size `n`.  `row_to_rank[i]` is the MPI
-    ///                     rank that owns global row `i` (0-based row index).
-    ///
-    /// Each rank need only supply the rows it owns; entries for non-local
-    /// rows are ignored.  Alternatively every rank may pass the full global
-    /// arrays — only the locally-owned rows will be stored.
-    void set_matrix(int n,
-                    const int* ia,
-                    const int* ja,
-                    const double* a,
-                    const int* row_to_rank);
-
-    /// Perform symbolic (phase 11) and numeric (phase 22) factorization.
-    /// Must be called after set_matrix().
-    void factorize();
-
-    /// Solve the system A x = rhs.
-    ///
-    /// @param rhs       On each rank, the local portion of the right-hand
-    ///                  side — i.e. entries for the rows owned by this rank,
-    ///                  in the same order they were given to set_matrix().
-    /// @param solution  On return, the local portion of the solution vector
-    ///                  (same size and ordering as @p rhs).
-    void solve(const double* rhs, double* solution);
-
     /// Provide the full global sparse matrix in 1-based CSR format.
     ///
-    /// Unlike set_matrix(), this method does **not** partition rows across
-    /// ranks.  Every rank must call this with the same (identical) matrix
-    /// data; only rank 0's copy is actually stored.  Subsequent calls to
-    /// factorize() will skip the gather step.
+    /// Every rank must call this method (it is collective).  Only
+    /// rank 0's data is read; other ranks may pass any valid pointers.
     ///
-    /// @param n   Global matrix dimension.
+    /// @param n   Global matrix dimension (rows = cols).
     /// @param ia  Row pointer array of size `n + 1` (1-based).
     /// @param ja  Column index array of size `ia[n] - 1` (1-based).
     /// @param a   Value array, same length as `ja`.
-    void set_global_matrix(int n,
-                           const int* ia,
-                           const int* ja,
-                           const double* a);
+    void set_matrix(int n,
+                    const int* ia,
+                    const int* ja,
+                    const double* a);
 
-    /// Solve A x = rhs when the full RHS is available on every rank.
+    /// Perform symbolic (phase 11) and numeric (phase 22) factorization.
     ///
-    /// Unlike solve(), both input and output are **global** vectors of
-    /// size `n`.  Rank 0 performs the PARDISO phase-33 call and the
-    /// solution is broadcast to all ranks via MPI_Bcast.
+    /// Collective — every rank must call this.
+    void factorize();
+
+    /// Solve A x = rhs.
     ///
-    /// @param global_rhs  Global right-hand side of size `n` (read on
-    ///                    rank 0, ignored on other ranks).
-    /// @param global_sol  On return, the global solution of size `n`
-    ///                    on every rank.
-    void solve_global(const double* global_rhs, double* global_sol);
+    /// Collective — every rank must call this.
+    /// Rank 0 must supply the global RHS of size n.  On return, every
+    /// rank holds the full global solution of size n (via MPI_Bcast).
+    ///
+    /// @param rhs  Global RHS vector of size n (used on rank 0).
+    /// @param sol  On return, the global solution of size n on every rank.
+    void solve(const double* rhs, double* sol);
 
 private:
     // ---- MPI state ----
-    MPI_Comm comm_;
+    MPI_Comm  comm_;
+    MPI_Fint  comm_fortran_;   ///< Fortran handle for cluster_sparse_solver.
     int rank_;
     int comm_size_;
 
@@ -115,35 +86,16 @@ private:
     int   msglvl_;          ///< Message level (0 = no output).
     bool  factorized_;      ///< True after successful factorize().
     bool  matrix_set_;      ///< True after successful set_matrix().
-    bool  global_mode_;     ///< True when set_global_matrix() was used.
 
     // ---- Global matrix dimension ----
     int n_;                 ///< Global number of rows/columns.
 
-    // ---- Local (this rank) CSR data ----
-    std::vector<int>    local_rows_;   ///< Sorted global row indices owned by this rank.
-    std::vector<int>    local_ia_;     ///< Local row pointers (1-based).
-    std::vector<int>    local_ja_;     ///< Local column indices (1-based).
-    std::vector<double> local_a_;      ///< Local values.
-
-    // ---- Gathered (rank-0 only) global CSR ----
+    // ---- Global CSR (rank 0 only) ----
     std::vector<int>    global_ia_;
     std::vector<int>    global_ja_;
     std::vector<double> global_a_;
 
-    // ---- Helpers ----
-
-    /// Gather local CSR pieces onto rank 0, rebuilding full global CSR.
-    void gather_matrix();
-
-    /// Gather local RHS pieces onto rank 0, returning the full RHS
-    /// (only meaningful on rank 0).
-    std::vector<double> gather_rhs(const double* local_rhs);
-
-    /// Scatter the global solution from rank 0 to each rank's local portion.
-    void scatter_solution(const double* global_sol, double* local_sol);
-
-    /// Release PARDISO internal memory (phase -1).  Safe to call even if
-    /// no factorization was performed.
+    /// Release Cluster PARDISO internal memory (phase -1).
+    /// Collective — all ranks must participate.
     void pardiso_cleanup();
 };
