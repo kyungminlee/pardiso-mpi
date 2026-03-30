@@ -60,12 +60,13 @@ int main(int argc, char* argv[])
     for (auto const& t : triplets)
         rhs[t.row] += t.value;   // * 1.0
 
-    // Solve.
-    SparseMatrixSolvePardiso solver(MPI_COMM_WORLD, N);
-    solver.update(triplets, rowToRank);
-
+    // Solve. Scope the solver so it is destroyed before MPI_Finalize.
     std::vector<double> sol(N, 0.0);
-    solver.solve(rhs.data(), sol.data());
+    {
+        SparseMatrixSolvePardiso solver(MPI_COMM_WORLD, N);
+        solver.update(triplets, rowToRank);
+        solver.solve(rhs.data(), sol.data());
+    }
 
     // Print and verify on rank 0.
     if (rank == 0) {

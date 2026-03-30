@@ -178,17 +178,19 @@ int main(int argc, char* argv[])
 
     // ----------------------------------------------------------------
     // 4. Solve the system using the PardisoMPI wrapper.
+    //    The solver must be destroyed before MPI_Finalize, so we scope it.
     // ----------------------------------------------------------------
-    PardisoMPI solver(MPI_COMM_WORLD);
-    solver.set_matrix_type(11); // real unsymmetric
-
-    // Provide the full CSR matrix and row ownership map; the wrapper
-    // extracts only the locally-owned rows on each rank.
-    solver.set_matrix(N, ia.data(), ja.data(), a.data(), row_to_rank.data());
-    solver.factorize();
-
     std::vector<double> x_local(local_n, 0.0);
-    solver.solve(b_local.data(), x_local.data());
+    {
+        PardisoMPI solver(MPI_COMM_WORLD);
+        solver.set_matrix_type(11); // real unsymmetric
+
+        // Provide the full CSR matrix and row ownership map; the wrapper
+        // extracts only the locally-owned rows on each rank.
+        solver.set_matrix(N, ia.data(), ja.data(), a.data(), row_to_rank.data());
+        solver.factorize();
+        solver.solve(b_local.data(), x_local.data());
+    }
 
     // ----------------------------------------------------------------
     // 5. Each rank prints its portion of the solution.

@@ -29,23 +29,30 @@ else()
             "MKL not found. Set MKLROOT environment variable or install oneAPI MKL.")
     endif()
 
+    # Look for mkl.h in MKLROOT/include and MKLROOT/include/mkl
     set(MKL_INCLUDE_DIR "${MKLROOT}/include")
+    if(NOT EXISTS "${MKL_INCLUDE_DIR}/mkl.h" AND EXISTS "${MKL_INCLUDE_DIR}/mkl/mkl.h")
+        set(MKL_INCLUDE_DIR "${MKLROOT}/include/mkl")
+    endif()
 
     # Prefer the single-dynamic-library link model (libmkl_rt).
     find_library(MKL_RT_LIB mkl_rt
         PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
-        NO_DEFAULT_PATH)
+              "${MKLROOT}/lib/x86_64-linux-gnu")
 
     if(MKL_RT_LIB)
         set(MKL_LIBRARIES ${MKL_RT_LIB})
     else()
         # Static / layered linking as fallback.
         find_library(MKL_INTEL_LP64 mkl_intel_lp64
-            PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64" NO_DEFAULT_PATH)
+            PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
+                  "${MKLROOT}/lib/x86_64-linux-gnu")
         find_library(MKL_SEQUENTIAL mkl_sequential
-            PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64" NO_DEFAULT_PATH)
+            PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
+                  "${MKLROOT}/lib/x86_64-linux-gnu")
         find_library(MKL_CORE mkl_core
-            PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64" NO_DEFAULT_PATH)
+            PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
+                  "${MKLROOT}/lib/x86_64-linux-gnu")
         set(MKL_LIBRARIES ${MKL_INTEL_LP64} ${MKL_SEQUENTIAL} ${MKL_CORE})
     endif()
 

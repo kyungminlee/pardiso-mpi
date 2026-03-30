@@ -105,16 +105,18 @@ int main(int argc, char* argv[])
 
     // ----------------------------------------------------------------
     // 6. Solve with PardisoMPI.
+    //    Scope the solver so it is destroyed before MPI_Finalize.
     // ----------------------------------------------------------------
-    PardisoMPI solver(MPI_COMM_WORLD);
-    solver.set_matrix_type(11); // real unsymmetric
-
-    solver.set_matrix(N, A.ia.data(), A.ja.data(), A.a.data(),
-                      row_to_rank.data());
-    solver.factorize();
-
     std::vector<double> x_local(local_n, 0.0);
-    solver.solve(b_local.data(), x_local.data());
+    {
+        PardisoMPI solver(MPI_COMM_WORLD);
+        solver.set_matrix_type(11); // real unsymmetric
+
+        solver.set_matrix(N, A.ia.data(), A.ja.data(), A.a.data(),
+                          row_to_rank.data());
+        solver.factorize();
+        solver.solve(b_local.data(), x_local.data());
+    }
 
     // ----------------------------------------------------------------
     // 7. Print solution (each rank prints its rows in order).
