@@ -1,13 +1,16 @@
 # pardiso-mpi
 
-A C++ wrapper around Intel MKL PARDISO for distributed-memory (MPI) sparse direct solves. Each MPI rank owns a subset of rows; the wrapper coordinates the symbolic/numeric factorization and solve phases across ranks.
+A C++ wrapper around Intel MKL **Cluster PARDISO** for MPI-parallel sparse
+direct solves.  Cluster PARDISO distributes the factorization and solve
+work across all MPI ranks internally — no manual data partitioning is
+required.
 
 ## Requirements
 
 - CMake 3.15+
 - C++17 compiler
 - MPI implementation (OpenMPI, MPICH, Intel MPI, etc.)
-- Intel MKL (oneAPI or standalone)
+- Intel MKL (oneAPI or standalone) with Cluster PARDISO support
 
 ## Build
 
@@ -26,83 +29,64 @@ cmake ..
 
 ## Usage
 
-### Direct example (hardcoded 16x16 Laplacian)
+### Two API layers
 
-```bash
-mpirun -np 4 ./example_direct
+| Class | Input format | Use when... |
+|-------|-------------|-------------|
+| `PardisoMPI` | 1-based CSR | You already have CSR arrays |
+| `SparseMatrixSolvePardiso` | 0-based COO triplets | You have (row, col, value) entries |
+
+Both are collective — every MPI rank must call the same methods in the
+same order.  Every rank supplies the same (identical) matrix and RHS.
+After a solve, every rank holds the full solution.
+
+### Quick start (PardisoMPI)
+
+```cpp
+#include "pardiso_mpi.h"
+
+// All ranks have the same CSR matrix (ia, ja, a) and RHS (b).
+PardisoMPI solver(MPI_COMM_WORLD);
+solver.set_matrix(n, ia, ja, a);
+solver.factorize();
+solver.solve(b, x);   // x has the full solution on every rank
 ```
 
-### Matrix Market example
+### Quick start (SparseMatrixSolvePardiso)
 
-```bash
-mpirun -np 4 ./example_mmio ../examples/laplacian_16x16.mtx
+```cpp
+#include "sparse_matrix_solve_pardiso.h"
+
+// All ranks have the same triplets and RHS.
+SparseMatrixSolvePardiso solver(MPI_COMM_WORLD, n);
+solver.update(triplets);           // COO -> CSR, factorize
+solver.solve(rhs, sol);            // solve, broadcast solution
 ```
 
-### Triplet-input example (SparseMatrixSolvePardiso)
+### Examples
 
 ```bash
-mpirun -np 4 ./example_sparse_solve
+mpirun -np 4 ./example_direct         # Hardcoded 16x16 Laplacian (CSR)
+mpirun -np 4 ./example_sparse_solve   # Same matrix via triplets
+mpirun -np 4 ./example_mmio ../examples/laplacian_16x16.mtx  # Matrix Market file
 ```
 
-All examples print the solution vector and the residual norm to verify correctness.
+All examples print the solution vector and the residual norm to verify
+correctness.
 
 ## Example Output
 
 ### `mpirun -np 4 ./example_direct`
 
 ```
-Rank 0 solution:
+Solution:
   x[ 0] = 1.000000e+00  (exact = 1.000000e+00)
   x[ 1] = 1.000000e+00  (exact = 1.000000e+00)
-  x[ 2] = 1.000000e+00  (exact = 1.000000e+00)
-  x[ 3] = 1.000000e+00  (exact = 1.000000e+00)
-Rank 1 solution:
-  x[ 4] = 1.000000e+00  (exact = 1.000000e+00)
-  x[ 5] = 1.000000e+00  (exact = 1.000000e+00)
-  x[ 6] = 1.000000e+00  (exact = 1.000000e+00)
-  x[ 7] = 1.000000e+00  (exact = 1.000000e+00)
-Rank 2 solution:
-  x[ 8] = 1.000000e+00  (exact = 1.000000e+00)
-  x[ 9] = 1.000000e+00  (exact = 1.000000e+00)
-  x[10] = 1.000000e+00  (exact = 1.000000e+00)
-  x[11] = 1.000000e+00  (exact = 1.000000e+00)
-Rank 3 solution:
-  x[12] = 1.000000e+00  (exact = 1.000000e+00)
-  x[13] = 1.000000e+00  (exact = 1.000000e+00)
-  x[14] = 1.000000e+00  (exact = 1.000000e+00)
+  ...
   x[15] = 1.000000e+00  (exact = 1.000000e+00)
 
 Residual ||Ax - b||_2 = 1.332268e-15
 Solution error ||x - x_exact||_2 = 4.577567e-16
-```
-
-### `mpirun -np 4 ./example_mmio examples/laplacian_16x16.mtx`
-
-```
-Reading matrix from examples/laplacian_16x16.mtx ...
-Matrix: 16 x 16, nnz = 64
-Rank 0 solution:
-  x[ 0] = 8.333333e-01
-  x[ 1] = 1.166667e+00
-  x[ 2] = 1.166667e+00
-  x[ 3] = 8.333333e-01
-Rank 1 solution:
-  x[ 4] = 1.166667e+00
-  x[ 5] = 1.666667e+00
-  x[ 6] = 1.666667e+00
-  x[ 7] = 1.166667e+00
-Rank 2 solution:
-  x[ 8] = 1.166667e+00
-  x[ 9] = 1.666667e+00
-  x[10] = 1.666667e+00
-  x[11] = 1.166667e+00
-Rank 3 solution:
-  x[12] = 8.333333e-01
-  x[13] = 1.166667e+00
-  x[14] = 1.166667e+00
-  x[15] = 8.333333e-01
-
-Residual ||Ax - b||_2 = 2.106500e-15
 ```
 
 ### `mpirun -np 4 ./example_sparse_solve`
@@ -110,20 +94,7 @@ Residual ||Ax - b||_2 = 2.106500e-15
 ```
 Solution:
   x[ 0] = 1.000000e+00
-  x[ 1] = 1.000000e+00
-  x[ 2] = 1.000000e+00
-  x[ 3] = 1.000000e+00
-  x[ 4] = 1.000000e+00
-  x[ 5] = 1.000000e+00
-  x[ 6] = 1.000000e+00
-  x[ 7] = 1.000000e+00
-  x[ 8] = 1.000000e+00
-  x[ 9] = 1.000000e+00
-  x[10] = 1.000000e+00
-  x[11] = 1.000000e+00
-  x[12] = 1.000000e+00
-  x[13] = 1.000000e+00
-  x[14] = 1.000000e+00
+  ...
   x[15] = 1.000000e+00
 
 ||x - x_exact||_2 = 4.577567e-16

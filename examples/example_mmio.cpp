@@ -1,6 +1,6 @@
 // example_mmio.cpp
-// Reads a Matrix Market file, distributes across MPI ranks, and solves
-// using the PardisoMPI wrapper.
+// Reads a Matrix Market file and solves using the PardisoMPI wrapper
+// (Cluster PARDISO).
 //
 // Build and run:
 //   mpirun -np 4 ./example_mmio ../examples/laplacian_16x16.mtx
@@ -54,7 +54,7 @@ int main(int argc, char* argv[])
     const char* mtx_file = argv[1];
 
     // ----------------------------------------------------------------
-    // 2. Rank 0 reads the Matrix Market file.
+    // 2. Rank 0 reads the Matrix Market file; broadcast to all ranks.
     // ----------------------------------------------------------------
     CSRMatrix A;
     if (rank == 0) {
@@ -62,105 +62,34 @@ int main(int argc, char* argv[])
         A = read_matrix_market(mtx_file);
         std::printf("Matrix: %d x %d, nnz = %d\n", A.n, A.m, A.nnz);
     }
-
-    // ----------------------------------------------------------------
-    // 3. Broadcast the matrix to all ranks.
-    // ----------------------------------------------------------------
     bcast_csr(A, 0, MPI_COMM_WORLD);
     const int N = A.n;
 
     // ----------------------------------------------------------------
-    // 4. Create row-to-rank mapping (even distribution).
+    // 3. Set up RHS: b = [1, 1, ..., 1].
     // ----------------------------------------------------------------
-    std::vector<int> row_to_rank(N);
-    {
-        int rows_per_rank = N / nprocs;
-        int remainder     = N % nprocs;
-        int offset = 0;
-        for (int r = 0; r < nprocs; ++r) {
-            int count = rows_per_rank + (r < remainder ? 1 : 0);
-            for (int j = 0; j < count; ++j) {
-                row_to_rank[offset + j] = r;
-            }
-            offset += count;
-        }
-    }
+    std::vector<double> b(N, 1.0);
 
     // ----------------------------------------------------------------
-    // 5. Set up RHS: b = [1, 1, ..., 1].
-    //    Extract the local portion for this rank.
-    // ----------------------------------------------------------------
-    std::vector<int> local_rows;
-    for (int i = 0; i < N; ++i) {
-        if (row_to_rank[i] == rank)
-            local_rows.push_back(i);
-    }
-    const int local_n = static_cast<int>(local_rows.size());
-
-    std::vector<double> b_global(N, 1.0);
-    std::vector<double> b_local(local_n);
-    for (int li = 0; li < local_n; ++li) {
-        b_local[li] = b_global[local_rows[li]];
-    }
-
-    // ----------------------------------------------------------------
-    // 6. Solve with PardisoMPI.
+    // 4. Solve with Cluster PARDISO.
     //    Scope the solver so it is destroyed before MPI_Finalize.
     // ----------------------------------------------------------------
-    std::vector<double> x_local(local_n, 0.0);
+    std::vector<double> x(N, 0.0);
     {
         PardisoMPI solver(MPI_COMM_WORLD);
         solver.set_matrix_type(11); // real unsymmetric
-
-        solver.set_matrix(N, A.ia.data(), A.ja.data(), A.a.data(),
-                          row_to_rank.data());
+        solver.set_matrix(N, A.ia.data(), A.ja.data(), A.a.data());
         solver.factorize();
-        solver.solve(b_local.data(), x_local.data());
+        solver.solve(b.data(), x.data());
     }
 
     // ----------------------------------------------------------------
-    // 7. Print solution (each rank prints its rows in order).
+    // 5. Print solution and verify on rank 0.
     // ----------------------------------------------------------------
-    for (int r = 0; r < nprocs; ++r) {
-        if (rank == r) {
-            std::printf("Rank %d solution:\n", rank);
-            for (int li = 0; li < local_n; ++li) {
-                std::printf("  x[%2d] = %12.6e\n", local_rows[li], x_local[li]);
-            }
-            std::fflush(stdout);
-        }
-        MPI_Barrier(MPI_COMM_WORLD);
-    }
-
-    // ----------------------------------------------------------------
-    // 8. Gather full solution on rank 0 and compute residual.
-    // ----------------------------------------------------------------
-    std::vector<int> recv_counts(nprocs), recv_displs(nprocs);
-    MPI_Gather(&local_n, 1, MPI_INT, recv_counts.data(), 1, MPI_INT,
-               0, MPI_COMM_WORLD);
-
     if (rank == 0) {
-        recv_displs[0] = 0;
-        for (int r = 1; r < nprocs; ++r)
-            recv_displs[r] = recv_displs[r - 1] + recv_counts[r - 1];
-    }
-
-    std::vector<int> all_rows(rank == 0 ? N : 0);
-    MPI_Gatherv(local_rows.data(), local_n, MPI_INT,
-                all_rows.data(), recv_counts.data(), recv_displs.data(),
-                MPI_INT, 0, MPI_COMM_WORLD);
-
-    std::vector<double> all_x_flat(rank == 0 ? N : 0);
-    MPI_Gatherv(x_local.data(), local_n, MPI_DOUBLE,
-                all_x_flat.data(), recv_counts.data(), recv_displs.data(),
-                MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-    if (rank == 0) {
-        // Reassemble global solution.
-        std::vector<double> x_global(N, 0.0);
-        for (int k = 0; k < N; ++k) {
-            x_global[all_rows[k]] = all_x_flat[k];
-        }
+        std::printf("Solution:\n");
+        for (int i = 0; i < N; ++i)
+            std::printf("  x[%2d] = %12.6e\n", i, x[i]);
 
         // Compute residual r = A*x - b.
         std::vector<double> residual(N, 0.0);
@@ -168,9 +97,9 @@ int main(int argc, char* argv[])
             double sum = 0.0;
             for (int k = A.ia[i] - 1; k < A.ia[i + 1] - 1; ++k) {
                 int col = A.ja[k] - 1;
-                sum += A.a[k] * x_global[col];
+                sum += A.a[k] * x[col];
             }
-            residual[i] = sum - b_global[i];
+            residual[i] = sum - b[i];
         }
 
         double res_norm = 0.0;

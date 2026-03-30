@@ -44,6 +44,7 @@ else()
         set(MKL_LIBRARIES ${MKL_RT_LIB})
     else()
         # Static / layered linking as fallback.
+        # Cluster PARDISO requires BLACS in addition to the standard MKL libs.
         find_library(MKL_INTEL_LP64 mkl_intel_lp64
             PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
                   "${MKLROOT}/lib/x86_64-linux-gnu")
@@ -53,7 +54,21 @@ else()
         find_library(MKL_CORE mkl_core
             PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
                   "${MKLROOT}/lib/x86_64-linux-gnu")
+
+        # Try Intel MPI BLACS first, fall back to OpenMPI BLACS.
+        find_library(MKL_BLACS mkl_blacs_intelmpi_lp64
+            PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
+                  "${MKLROOT}/lib/x86_64-linux-gnu")
+        if(NOT MKL_BLACS)
+            find_library(MKL_BLACS mkl_blacs_openmpi_lp64
+                PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
+                      "${MKLROOT}/lib/x86_64-linux-gnu")
+        endif()
+
         set(MKL_LIBRARIES ${MKL_INTEL_LP64} ${MKL_SEQUENTIAL} ${MKL_CORE})
+        if(MKL_BLACS)
+            list(APPEND MKL_LIBRARIES ${MKL_BLACS})
+        endif()
     endif()
 
     if(NOT EXISTS "${MKL_INCLUDE_DIR}/mkl.h")

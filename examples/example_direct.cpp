@@ -116,7 +116,7 @@ int main(int argc, char* argv[])
 
     // ----------------------------------------------------------------
     // 1. Build the 16x16 Laplacian matrix (every rank has the full
-    //    matrix so that set_matrix() can extract the locally-owned rows).
+    //    matrix — only rank 0's copy is used by Cluster PARDISO).
     // ----------------------------------------------------------------
     int N = 0;
     std::vector<int>    ia, ja;
@@ -124,34 +124,12 @@ int main(int argc, char* argv[])
     build_laplacian_16(N, ia, ja, a);
 
     // ----------------------------------------------------------------
-    // 2. Create row-to-rank mapping: distribute rows as evenly as
-    //    possible.  With 4 ranks and 16 rows:
-    //      rank 0 -> rows 0-3
-    //      rank 1 -> rows 4-7
-    //      rank 2 -> rows 8-11
-    //      rank 3 -> rows 12-15
-    // ----------------------------------------------------------------
-    std::vector<int> row_to_rank(N);
-    {
-        int rows_per_rank = N / nprocs;
-        int remainder     = N % nprocs;
-        int offset = 0;
-        for (int r = 0; r < nprocs; ++r) {
-            int count = rows_per_rank + (r < remainder ? 1 : 0);
-            for (int j = 0; j < count; ++j) {
-                row_to_rank[offset + j] = r;
-            }
-            offset += count;
-        }
-    }
-
-    // ----------------------------------------------------------------
-    // 3. Set up the right-hand side.
+    // 2. Set up the right-hand side.
     //    We choose x_exact = [1, 1, ..., 1] and compute b = A * x_exact
     //    so that we can verify the solution against a known answer.
     // ----------------------------------------------------------------
     std::vector<double> x_exact(N, 1.0);
-    std::vector<double> b_global(N, 0.0);
+    std::vector<double> b(N, 0.0);
 
     // b = A * x_exact  (using the full CSR structure)
     for (int i = 0; i < N; ++i) {
@@ -160,88 +138,30 @@ int main(int argc, char* argv[])
             int col = ja[k] - 1; // convert to 0-based column
             sum += a[k] * x_exact[col];
         }
-        b_global[i] = sum;
-    }
-
-    // Extract the local portion of b for this rank.
-    std::vector<int> local_rows;
-    for (int i = 0; i < N; ++i) {
-        if (row_to_rank[i] == rank)
-            local_rows.push_back(i);
-    }
-    const int local_n = static_cast<int>(local_rows.size());
-
-    std::vector<double> b_local(local_n);
-    for (int li = 0; li < local_n; ++li) {
-        b_local[li] = b_global[local_rows[li]];
+        b[i] = sum;
     }
 
     // ----------------------------------------------------------------
-    // 4. Solve the system using the PardisoMPI wrapper.
+    // 3. Solve the system using Cluster PARDISO.
     //    The solver must be destroyed before MPI_Finalize, so we scope it.
     // ----------------------------------------------------------------
-    std::vector<double> x_local(local_n, 0.0);
+    std::vector<double> x(N, 0.0);
     {
         PardisoMPI solver(MPI_COMM_WORLD);
         solver.set_matrix_type(11); // real unsymmetric
-
-        // Provide the full CSR matrix and row ownership map; the wrapper
-        // extracts only the locally-owned rows on each rank.
-        solver.set_matrix(N, ia.data(), ja.data(), a.data(), row_to_rank.data());
+        solver.set_matrix(N, ia.data(), ja.data(), a.data());
         solver.factorize();
-        solver.solve(b_local.data(), x_local.data());
+        solver.solve(b.data(), x.data());
     }
 
     // ----------------------------------------------------------------
-    // 5. Each rank prints its portion of the solution.
+    // 4. Print and verify on rank 0 (every rank has the full solution).
     // ----------------------------------------------------------------
-    for (int r = 0; r < nprocs; ++r) {
-        if (rank == r) {
-            std::printf("Rank %d solution:\n", rank);
-            for (int li = 0; li < local_n; ++li) {
-                int gi = local_rows[li];
-                std::printf("  x[%2d] = %12.6e  (exact = %12.6e)\n",
-                            gi, x_local[li], x_exact[gi]);
-            }
-            std::fflush(stdout);
-        }
-        MPI_Barrier(MPI_COMM_WORLD);
-    }
-
-    // ----------------------------------------------------------------
-    // 6. Verify: gather full solution on rank 0 and compute the
-    //    residual ||A*x - b||_2.
-    // ----------------------------------------------------------------
-
-    // Gather full solution onto rank 0 for residual computation.
-    // Each rank sends its local_n values; rank 0 reassembles.
-    std::vector<int> recv_counts(nprocs), recv_displs(nprocs);
-    MPI_Gather(&local_n, 1, MPI_INT, recv_counts.data(), 1, MPI_INT,
-               0, MPI_COMM_WORLD);
-
     if (rank == 0) {
-        recv_displs[0] = 0;
-        for (int r = 1; r < nprocs; ++r)
-            recv_displs[r] = recv_displs[r - 1] + recv_counts[r - 1];
-    }
-
-    // Gather local row indices
-    std::vector<int> all_rows(rank == 0 ? N : 0);
-    MPI_Gatherv(local_rows.data(), local_n, MPI_INT,
-                all_rows.data(), recv_counts.data(), recv_displs.data(),
-                MPI_INT, 0, MPI_COMM_WORLD);
-
-    // Gather local solution values
-    std::vector<double> all_x_flat(rank == 0 ? N : 0);
-    MPI_Gatherv(x_local.data(), local_n, MPI_DOUBLE,
-                all_x_flat.data(), recv_counts.data(), recv_displs.data(),
-                MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-    if (rank == 0) {
-        // Reassemble global solution in order.
-        std::vector<double> x_global(N, 0.0);
-        for (int k = 0; k < N; ++k) {
-            x_global[all_rows[k]] = all_x_flat[k];
+        std::printf("Solution:\n");
+        for (int i = 0; i < N; ++i) {
+            std::printf("  x[%2d] = %12.6e  (exact = %12.6e)\n",
+                        i, x[i], x_exact[i]);
         }
 
         // Compute residual r = A*x - b.
@@ -250,9 +170,9 @@ int main(int argc, char* argv[])
             double sum = 0.0;
             for (int k = ia[i] - 1; k < ia[i + 1] - 1; ++k) {
                 int col = ja[k] - 1;
-                sum += a[k] * x_global[col];
+                sum += a[k] * x[col];
             }
-            residual[i] = sum - b_global[i];
+            residual[i] = sum - b[i];
         }
 
         double res_norm = 0.0;
@@ -262,7 +182,7 @@ int main(int argc, char* argv[])
 
         double err_norm = 0.0;
         for (int i = 0; i < N; ++i) {
-            double d = x_global[i] - x_exact[i];
+            double d = x[i] - x_exact[i];
             err_norm += d * d;
         }
         err_norm = std::sqrt(err_norm);
