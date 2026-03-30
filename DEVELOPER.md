@@ -212,6 +212,195 @@ The caller passes **global** arrays of size `n` on every rank.
 | `solve` / `scatter_solution`| 1x `MPI_Gather` + 1x `MPI_Gatherv` + 1x `MPI_Scatterv` | rank 0 -> all |
 | `SparseMatrixSolvePardiso::solve` (extra) | 1x `MPI_Allgather` + 2x `MPI_Allgatherv` | all <-> all |
 
+## Sequence Diagrams (PlantUML)
+
+### `PardisoMPI`: Factorize and Solve
+
+```plantuml
+@startuml pardiso_mpi_sequence
+skinparam sequenceMessageAlign center
+skinparam participantPadding 20
+
+participant "Caller"       as C
+participant "Rank 0"       as R0
+participant "Rank 1..P-1"  as RN
+participant "MKL PARDISO"  as P
+
+== set_matrix(n, ia, ja, a, row_to_rank) ==
+
+C -> R0 : set_matrix()
+C -> RN : set_matrix()
+note over R0, RN
+  Each rank independently extracts local rows
+  from the full CSR based on row_to_rank[i] == my_rank.
+  No MPI communication.
+end note
+R0 -> R0 : local_rows_, local_ia_, local_ja_, local_a_
+RN -> RN : local_rows_, local_ia_, local_ja_, local_a_
+
+== factorize() ==
+
+C -> R0 : factorize()
+C -> RN : factorize()
+
+group gather_matrix [MPI Gather onto Rank 0]
+  RN -> R0 : MPI_Gather(local_n)
+  RN -> R0 : MPI_Gather(local_nnz)
+  RN -> R0 : MPI_Gatherv(local_rows_)
+  RN -> R0 : MPI_Gatherv(local_ia_)
+  RN -> R0 : MPI_Gatherv(local_ja_)
+  RN -> R0 : MPI_Gatherv(local_a_)
+end
+
+R0 -> R0 : Sort received rows by global index
+R0 -> R0 : Rebuild global_ia_, global_ja_, global_a_
+
+R0 -> P : pardisoinit(pt, mtype, iparm)
+R0 -> P : pardiso(phase=11) — symbolic factorization
+R0 <-- P : reordering + symbolic structure
+R0 -> P : pardiso(phase=22) — numerical factorization
+R0 <-- P : L and U factors stored in pt[]
+
+R0 -> RN : MPI_Barrier
+note over R0, RN : All ranks synchronized
+
+== solve(local_rhs, local_sol) ==
+
+C -> R0 : solve()
+C -> RN : solve()
+
+group gather_rhs [MPI Gather onto Rank 0]
+  RN -> R0 : MPI_Gather(local_n)
+  RN -> R0 : MPI_Gatherv(local_rows_)
+  RN -> R0 : MPI_Gatherv(local_rhs values)
+end
+
+R0 -> R0 : Assemble global_rhs:\nglobal_rhs[row_idx] = value
+
+R0 -> P : pardiso(phase=33) — solve
+R0 <-- P : global_sol[0..n-1]
+
+group scatter_solution [MPI Scatter from Rank 0]
+  RN -> R0 : MPI_Gatherv(local_rows_)
+  R0 -> R0 : Reorder global_sol into\nper-rank send buffer
+  R0 -> RN : MPI_Scatterv(local_sol)
+end
+
+note over R0, RN
+  Each rank now holds its local
+  portion of the solution vector.
+end note
+
+== destructor ==
+
+R0 -> P : pardiso(phase=-1) — release memory
+R0 -> R0 : MPI_Comm_free
+RN -> RN : MPI_Comm_free
+
+@enduml
+```
+
+### `SparseMatrixSolvePardiso`: Update and Solve
+
+```plantuml
+@startuml sparse_matrix_solve_sequence
+skinparam sequenceMessageAlign center
+skinparam participantPadding 20
+
+participant "Caller"              as C
+participant "SparseMatrixSolve\n(all ranks)" as S
+participant "PardisoMPI\n(internal)"         as PM
+participant "Rank 0\n(PARDISO)"              as R0
+
+== update(triplets, rowToRank) ==
+
+C -> S : update(triplets, rowToRank)
+
+S -> S : triplets_to_csr():\n1. Sort by (row, col)\n2. Sum duplicates\n3. Build 1-based CSR
+
+S -> PM : set_matrix(n, ia, ja, a, row_to_rank)
+note right : Each rank extracts local rows\n(no communication)
+
+S -> PM : factorize()
+PM -> R0 : gather_matrix()\n[6x MPI_Gather/Gatherv]
+R0 -> R0 : Rebuild global CSR
+R0 -> R0 : PARDISO phase 11 + 22
+PM <-- R0 : MPI_Barrier
+
+== solve(rhs, sol) — global arrays on all ranks ==
+
+C -> S : solve(rhs, sol)
+
+S -> S : Extract local_rhs from\nglobal rhs using local_rows_
+
+S -> PM : solve(local_rhs, local_sol)
+PM -> R0 : gather_rhs()\n[3x MPI_Gather/Gatherv]
+R0 -> R0 : PARDISO phase 33
+R0 -> PM : scatter_solution()\n[MPI_Gatherv + MPI_Scatterv]
+S <-- PM : local_sol (per-rank portion)
+
+group Allgatherv [Broadcast full solution to all ranks]
+  S -> S : MPI_Allgather(local_n)
+  S -> S : MPI_Allgatherv(local_rows_)
+  S -> S : MPI_Allgatherv(local_sol_)
+end
+
+S -> S : Reconstruct global sol:\nsol[all_rows[k]] = all_vals[k]
+
+S --> C : sol[] filled on every rank
+
+@enduml
+```
+
+### Data Ownership Across Ranks
+
+```plantuml
+@startuml data_ownership
+skinparam packageStyle rectangle
+
+package "Rank 0" {
+  [local_rows_ = {0,1,2,3}]  as L0
+  [local CSR: rows 0-3]       as CSR0
+  [global CSR: rows 0-15]     as GCSR  #LightGreen
+  [PARDISO factors (pt[])]    as FACT  #LightGreen
+  note right of GCSR : Only on rank 0\nafter gather_matrix()
+}
+
+package "Rank 1" {
+  [local_rows_ = {4,5,6,7}]  as L1
+  [local CSR: rows 4-7]       as CSR1
+}
+
+package "Rank 2" {
+  [local_rows_ = {8,9,10,11}] as L2
+  [local CSR: rows 8-11]       as CSR2
+}
+
+package "Rank 3" {
+  [local_rows_ = {12,13,14,15}] as L3
+  [local CSR: rows 12-15]        as CSR3
+}
+
+CSR0 -[hidden]-> GCSR
+CSR1 -[hidden]-> L1
+CSR2 -[hidden]-> L2
+CSR3 -[hidden]-> L3
+
+note bottom of "Rank 0"
+  Rank 0 holds both its local slice
+  AND the gathered global matrix
+  plus PARDISO's internal state.
+end note
+
+note bottom of "Rank 3"
+  Non-root ranks only hold
+  their local CSR slice and
+  local portions of RHS/solution.
+end note
+
+@enduml
+```
+
 ## Limitations and Design Choices
 
 - **Rank 0 bottleneck**: All factorization and solve work happens on rank 0.
