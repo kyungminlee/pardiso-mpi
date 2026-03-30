@@ -62,6 +62,7 @@ endif()
 add_library(pardiso_mpi
     src/pardiso_mpi.cpp
     src/mmio.cpp
+    src/sparse_matrix_solve_pardiso.cpp
 )
 
 target_include_directories(pardiso_mpi
@@ -89,3 +90,6 @@ target_link_libraries(example_direct PRIVATE pardiso_mpi)
 
 add_executable(example_mmio examples/example_mmio.cpp)
 target_link_libraries(example_mmio PRIVATE pardiso_mpi)
+
+add_executable(example_sparse_solve examples/example_sparse_solve.cpp)
+target_link_libraries(example_sparse_solve PRIVATE pardiso_mpi)
