@@ -94,7 +94,7 @@ int main(int argc, char* argv[])
     // ----------------------------------------------------------------
     std::vector<double> x(N, 0.0);
     {
-        PardisoMPI solver(MPI_COMM_WORLD);
+        PardisoMPI<double> solver(MPI_COMM_WORLD);
         solver.set_matrix_type(11); // real unsymmetric
         solver.set_matrix(N, local_nrows, owned_rows.data(),
                           local_ia.data(),
