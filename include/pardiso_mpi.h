@@ -9,10 +9,12 @@
 /// in the communicator must call them.  The solver distributes work
 /// internally across MPI ranks.
 ///
-/// With the default `iparm[39] = 0` (centralised input), only rank 0
-/// needs to supply the matrix and RHS data; other ranks may pass dummy
-/// pointers.  After a solve, the solution is broadcast so that every
-/// rank holds the full result.
+/// Uses **distributed assembled input** (`iparm[39] = 2`): each MPI
+/// rank provides only the rows it owns.  Rows need not be contiguous —
+/// the wrapper builds an internal permutation to map each rank's rows
+/// to a contiguous block, remaps column indices accordingly, and
+/// inverse-permutes the solution after the solve.  After a solve, the
+/// full solution is assembled on every rank via `MPI_Allgatherv`.
 ///
 /// Matrix storage follows **1-based CSR** indexing (PARDISO convention).
 class PardisoMPI {
@@ -41,16 +43,26 @@ public:
     ///   * 11 – real unsymmetric (default)
     void set_matrix_type(int mtype);
 
-    /// Provide the full global sparse matrix in 1-based CSR format.
+    /// Provide this rank's portion of the sparse matrix in 1-based CSR.
     ///
-    /// Every rank must call this method (it is collective).  Only
-    /// rank 0's data is read; other ranks may pass any valid pointers.
+    /// Every rank must call this method (it is collective).  Each rank
+    /// supplies only the rows it owns.  The rows need **not** be
+    /// contiguous; the wrapper internally builds a symmetric permutation
+    /// so that each rank's rows form a contiguous block for Cluster
+    /// PARDISO, and remaps column indices accordingly.
     ///
-    /// @param n   Global matrix dimension (rows = cols).
-    /// @param ia  Row pointer array of size `n + 1` (1-based).
-    /// @param ja  Column index array of size `ia[n] - 1` (1-based).
-    /// @param a   Value array, same length as `ja`.
-    void set_matrix(int n,
+    /// @param n           Global matrix dimension (rows = cols).
+    /// @param local_nrows Number of rows owned by this rank.
+    /// @param owned_rows  Array of `local_nrows` row indices owned by this
+    ///                    rank (1-based).  Across all ranks, these must be
+    ///                    non-overlapping and together cover [1, n].
+    /// @param ia  Local row pointer array of size `local_nrows + 1` (1-based).
+    ///            Row i of `ia`/`ja`/`a` corresponds to global row
+    ///            `owned_rows[i]`.
+    /// @param ja  Local column index array of size `ia[local_nrows] - 1`
+    ///            (global 1-based column indices).
+    /// @param a   Local value array, same length as `ja`.
+    void set_matrix(int n, int local_nrows, const int* owned_rows,
                     const int* ia,
                     const int* ja,
                     const double* a);
@@ -63,10 +75,11 @@ public:
     /// Solve A x = rhs.
     ///
     /// Collective — every rank must call this.
-    /// Rank 0 must supply the global RHS of size n.  On return, every
-    /// rank holds the full global solution of size n (via MPI_Bcast).
+    /// Every rank must supply the full global RHS of size n.  On return,
+    /// every rank holds the full global solution of size n (via
+    /// MPI_Allgatherv).
     ///
-    /// @param rhs  Global RHS vector of size n (used on rank 0).
+    /// @param rhs  Global RHS vector of size n.
     /// @param sol  On return, the global solution of size n on every rank.
     void solve(const double* rhs, double* sol);
 
@@ -90,10 +103,20 @@ private:
     // ---- Global matrix dimension ----
     int n_;                 ///< Global number of rows/columns.
 
-    // ---- Global CSR (rank 0 only) ----
-    std::vector<int>    global_ia_;
-    std::vector<int>    global_ja_;
-    std::vector<double> global_a_;
+    // ---- Permutation (maps non-contiguous ownership to contiguous) ----
+    int first_row_;         ///< First permuted row for this rank (1-based).
+    int last_row_;          ///< Last permuted row for this rank (1-based).
+    std::vector<int> perm_;   ///< perm_[new] = old (0-based).
+    std::vector<int> iperm_;  ///< iperm_[old] = new (0-based).
+
+    // ---- Local CSR (permuted, contiguous rows for PARDISO) ----
+    std::vector<int>    local_ia_;
+    std::vector<int>    local_ja_;
+    std::vector<double> local_a_;
+
+    // ---- Gather metadata for MPI_Allgatherv in solve ----
+    std::vector<int> gather_counts_;  ///< local_nrows per rank.
+    std::vector<int> gather_displs_;  ///< Displacement per rank.
 
     /// Release Cluster PARDISO internal memory (phase -1).
     /// Collective — all ranks must participate.

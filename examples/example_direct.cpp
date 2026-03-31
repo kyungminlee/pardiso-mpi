@@ -115,8 +115,8 @@ int main(int argc, char* argv[])
     MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
 
     // ----------------------------------------------------------------
-    // 1. Build the 16x16 Laplacian matrix (every rank has the full
-    //    matrix — only rank 0's copy is used by Cluster PARDISO).
+    // 1. Build the 16x16 Laplacian matrix (every rank builds the full
+    //    matrix, then extracts its local rows).
     // ----------------------------------------------------------------
     int N = 0;
     std::vector<int>    ia, ja;
@@ -142,20 +142,41 @@ int main(int argc, char* argv[])
     }
 
     // ----------------------------------------------------------------
-    // 3. Solve the system using Cluster PARDISO.
+    // 3. Partition rows across MPI ranks and extract local CSR.
+    // ----------------------------------------------------------------
+    int rows_per_rank = N / nprocs;
+    int remainder     = N % nprocs;
+    int first_row_0   = rank * rows_per_rank + std::min(rank, remainder);
+    int local_nrows   = rows_per_rank + (rank < remainder ? 1 : 0);
+
+    // Build owned_rows (1-based) and local ia (re-based to start at 1).
+    std::vector<int> owned_rows(local_nrows);
+    for (int i = 0; i < local_nrows; ++i)
+        owned_rows[i] = first_row_0 + i + 1;   // 1-based
+
+    int nnz_offset = ia[first_row_0] - 1;  // 0-based index into ja/a
+    std::vector<int> local_ia(local_nrows + 1);
+    for (int i = 0; i <= local_nrows; ++i)
+        local_ia[i] = ia[first_row_0 + i] - ia[first_row_0] + 1;
+
+    // ----------------------------------------------------------------
+    // 4. Solve the system using Cluster PARDISO.
     //    The solver must be destroyed before MPI_Finalize, so we scope it.
     // ----------------------------------------------------------------
     std::vector<double> x(N, 0.0);
     {
         PardisoMPI solver(MPI_COMM_WORLD);
         solver.set_matrix_type(11); // real unsymmetric
-        solver.set_matrix(N, ia.data(), ja.data(), a.data());
+        solver.set_matrix(N, local_nrows, owned_rows.data(),
+                          local_ia.data(),
+                          ja.data() + nnz_offset,
+                          a.data() + nnz_offset);
         solver.factorize();
         solver.solve(b.data(), x.data());
     }
 
     // ----------------------------------------------------------------
-    // 4. Print and verify on rank 0 (every rank has the full solution).
+    // 5. Print and verify on rank 0 (every rank has the full solution).
     // ----------------------------------------------------------------
     if (rank == 0) {
         std::printf("Solution:\n");

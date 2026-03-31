@@ -13,10 +13,11 @@ struct Triplet {
 
 /// High-level MPI-parallel sparse solver wrapper around PardisoMPI.
 ///
-/// Every rank must supply the **same** complete matrix (via triplets) and
-/// the **same** complete RHS vector.  Cluster PARDISO distributes the
-/// factorization and solve work across all MPI ranks internally.
-/// The solution is broadcast so every rank holds the full result.
+/// Every rank must supply the **same** complete set of triplets and the
+/// **same** complete RHS vector.  The wrapper partitions rows across MPI
+/// ranks and uses distributed assembled input (`iparm[39] = 2`) so that
+/// each rank only stores and factorizes its own rows.  The solution is
+/// assembled on every rank via `MPI_Allgatherv`.
 ///
 /// Usage:
 ///   SparseMatrixSolvePardiso solver(MPI_COMM_WORLD, n);
@@ -58,13 +59,18 @@ public:
 
 private:
     int n_;
+    int rank_;
+    int comm_size_;
+    int first_row_;   ///< First row owned by this rank (1-based).
+    int last_row_;    ///< Last row owned by this rank (1-based).
     PardisoMPI pardiso_;
 
-    // Full CSR storage (1-based, PARDISO convention).
+    // Local CSR storage (1-based, PARDISO convention).
     std::vector<int>    ia_;
     std::vector<int>    ja_;
     std::vector<double> a_;
 
-    /// Convert triplets to 1-based CSR, summing duplicates.
+    /// Convert triplets to local 1-based CSR (only rows owned by this
+    /// rank), summing duplicates.
     void triplets_to_csr(std::vector<Triplet> const& triplets);
 };

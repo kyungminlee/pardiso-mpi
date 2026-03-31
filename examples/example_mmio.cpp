@@ -8,6 +8,7 @@
 #include "pardiso_mpi.h"
 #include "mmio.h"
 #include <mpi.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -66,25 +67,45 @@ int main(int argc, char* argv[])
     const int N = A.n;
 
     // ----------------------------------------------------------------
-    // 3. Set up RHS: b = [1, 1, ..., 1].
+    // 3. Partition rows across MPI ranks and extract local CSR.
+    // ----------------------------------------------------------------
+    int rows_per_rank = N / nprocs;
+    int remainder     = N % nprocs;
+    int first_row_0   = rank * rows_per_rank + std::min(rank, remainder);
+    int local_nrows   = rows_per_rank + (rank < remainder ? 1 : 0);
+
+    std::vector<int> owned_rows(local_nrows);
+    for (int i = 0; i < local_nrows; ++i)
+        owned_rows[i] = first_row_0 + i + 1;   // 1-based
+
+    int nnz_offset = A.ia[first_row_0] - 1;
+    std::vector<int> local_ia(local_nrows + 1);
+    for (int i = 0; i <= local_nrows; ++i)
+        local_ia[i] = A.ia[first_row_0 + i] - A.ia[first_row_0] + 1;
+
+    // ----------------------------------------------------------------
+    // 4. Set up RHS: b = [1, 1, ..., 1].
     // ----------------------------------------------------------------
     std::vector<double> b(N, 1.0);
 
     // ----------------------------------------------------------------
-    // 4. Solve with Cluster PARDISO.
+    // 5. Solve with Cluster PARDISO.
     //    Scope the solver so it is destroyed before MPI_Finalize.
     // ----------------------------------------------------------------
     std::vector<double> x(N, 0.0);
     {
         PardisoMPI solver(MPI_COMM_WORLD);
         solver.set_matrix_type(11); // real unsymmetric
-        solver.set_matrix(N, A.ia.data(), A.ja.data(), A.a.data());
+        solver.set_matrix(N, local_nrows, owned_rows.data(),
+                          local_ia.data(),
+                          A.ja.data() + nnz_offset,
+                          A.a.data() + nnz_offset);
         solver.factorize();
         solver.solve(b.data(), x.data());
     }
 
     // ----------------------------------------------------------------
-    // 5. Print solution and verify on rank 0.
+    // 6. Print solution and verify on rank 0.
     // ----------------------------------------------------------------
     if (rank == 0) {
         std::printf("Solution:\n");
