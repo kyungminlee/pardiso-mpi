@@ -19,6 +19,21 @@
 /// Matrix storage follows **1-based CSR** indexing (PARDISO convention).
 class PardisoMPI {
 public:
+    /// Solver phase — tracks how far the factorization has progressed.
+    enum class Phase {
+        initial,       ///< No matrix set yet.
+        matrix_set,    ///< Matrix data stored; no factorization performed.
+        symbolic,      ///< Symbolic factorization complete (phase 11).
+        numeric        ///< Numeric factorization complete (phase 22); ready to solve.
+    };
+
+    /// Controls which system is solved during the solve phase.
+    enum class SolveType {
+        normal,        ///< Solve A   x = rhs.
+        transpose,     ///< Solve A^T x = rhs.
+        adjoint        ///< Solve A^H x = rhs (same as transpose for real matrices).
+    };
+
     /// Construct a solver bound to the given MPI communicator.
     /// The communicator is duplicated internally so the caller may
     /// free the original at any time after construction.
@@ -67,21 +82,43 @@ public:
                     const int* ja,
                     const double* a);
 
+    /// Perform symbolic factorization only (phase 11).
+    ///
+    /// Collective — every rank must call this.
+    /// Requires set_matrix() to have been called first.
+    void symbolic_factorize();
+
+    /// Perform numeric factorization only (phase 22).
+    ///
+    /// Collective — every rank must call this.
+    /// Requires symbolic_factorize() to have been called first.
+    /// Can be called again after symbolic_factorize() to re-do
+    /// numeric factorization with updated values (same sparsity pattern).
+    void numeric_factorize();
+
     /// Perform symbolic (phase 11) and numeric (phase 22) factorization.
+    ///
+    /// Convenience method equivalent to calling symbolic_factorize()
+    /// followed by numeric_factorize().
     ///
     /// Collective — every rank must call this.
     void factorize();
 
-    /// Solve A x = rhs.
+    /// Solve A x = rhs (or A^T x = rhs, or A^H x = rhs).
     ///
     /// Collective — every rank must call this.
     /// Every rank must supply the full global RHS of size n.  On return,
     /// every rank holds the full global solution of size n (via
     /// MPI_Allgatherv).
     ///
-    /// @param rhs  Global RHS vector of size n.
-    /// @param sol  On return, the global solution of size n on every rank.
-    void solve(const double* rhs, double* sol);
+    /// @param rhs        Global RHS vector of size n.
+    /// @param sol        On return, the global solution of size n on every rank.
+    /// @param solve_type Which system to solve (default: normal, i.e. A x = rhs).
+    void solve(const double* rhs, double* sol,
+               SolveType solve_type = SolveType::normal);
+
+    /// Return the current solver phase.
+    Phase phase() const { return phase_; }
 
 private:
     // ---- MPI state ----
@@ -97,8 +134,7 @@ private:
     int   maxfct_;          ///< Max factors kept in memory.
     int   mnum_;            ///< Which factorization to use.
     int   msglvl_;          ///< Message level (0 = no output).
-    bool  factorized_;      ///< True after successful factorize().
-    bool  matrix_set_;      ///< True after successful set_matrix().
+    Phase phase_;           ///< Current solver phase.
 
     // ---- Global matrix dimension ----
     int n_;                 ///< Global number of rows/columns.
@@ -117,6 +153,9 @@ private:
     // ---- Gather metadata for MPI_Allgatherv in solve ----
     std::vector<int> gather_counts_;  ///< local_nrows per rank.
     std::vector<int> gather_displs_;  ///< Displacement per rank.
+
+    /// Initialise iparm and pt arrays for a fresh factorization.
+    void init_pardiso_params();
 
     /// Release Cluster PARDISO internal memory (phase -1).
     /// Collective — all ranks must participate.

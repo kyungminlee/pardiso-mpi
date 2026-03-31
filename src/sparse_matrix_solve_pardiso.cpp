@@ -26,9 +26,10 @@ SparseMatrixSolvePardiso::SparseMatrixSolvePardiso(MPI_Comm comm, int n,
 }
 
 // ---------------------------------------------------------------------------
-// update — convert triplets to local CSR, set matrix, factorize
+// set_triplets — convert triplets to local CSR, set matrix (no factorize)
 // ---------------------------------------------------------------------------
-void SparseMatrixSolvePardiso::update(std::vector<Triplet> const& triplets)
+void SparseMatrixSolvePardiso::set_triplets(
+    std::vector<Triplet> const& triplets)
 {
     // Convert COO triplets to local 1-based CSR.
     triplets_to_csr(triplets);
@@ -39,18 +40,43 @@ void SparseMatrixSolvePardiso::update(std::vector<Triplet> const& triplets)
     for (int i = 0; i < local_nrows; ++i)
         owned_rows[i] = first_row_ + i;   // 1-based
 
-    // Pass local CSR to Cluster PARDISO and factorize.
+    // Pass local CSR to Cluster PARDISO.
     pardiso_.set_matrix(n_, local_nrows, owned_rows.data(),
                         ia_.data(), ja_.data(), a_.data());
+}
+
+// ---------------------------------------------------------------------------
+// symbolic_factorize
+// ---------------------------------------------------------------------------
+void SparseMatrixSolvePardiso::symbolic_factorize()
+{
+    pardiso_.symbolic_factorize();
+}
+
+// ---------------------------------------------------------------------------
+// numeric_factorize
+// ---------------------------------------------------------------------------
+void SparseMatrixSolvePardiso::numeric_factorize()
+{
+    pardiso_.numeric_factorize();
+}
+
+// ---------------------------------------------------------------------------
+// update — convert triplets to local CSR, set matrix, factorize
+// ---------------------------------------------------------------------------
+void SparseMatrixSolvePardiso::update(std::vector<Triplet> const& triplets)
+{
+    set_triplets(triplets);
     pardiso_.factorize();
 }
 
 // ---------------------------------------------------------------------------
 // solve — Cluster PARDISO phase 33, assemble result on all ranks
 // ---------------------------------------------------------------------------
-void SparseMatrixSolvePardiso::solve(double* rhs, double* sol)
+void SparseMatrixSolvePardiso::solve(double* rhs, double* sol,
+                                     PardisoMPI::SolveType solve_type)
 {
-    pardiso_.solve(rhs, sol);
+    pardiso_.solve(rhs, sol, solve_type);
 }
 
 // ---------------------------------------------------------------------------

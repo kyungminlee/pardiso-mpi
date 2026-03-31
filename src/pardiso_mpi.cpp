@@ -26,8 +26,7 @@ PardisoMPI::PardisoMPI(MPI_Comm comm)
     , maxfct_(1)
     , mnum_(1)
     , msglvl_(0)
-    , factorized_(false)
-    , matrix_set_(false)
+    , phase_(Phase::initial)
     , n_(0)
     , first_row_(0)
     , last_row_(-1)
@@ -75,9 +74,8 @@ void PardisoMPI::set_matrix(int n, int local_nrows,
                             const double* a)
 {
     // If a previous factorization exists, clean it up first.
-    if (factorized_) {
+    if (phase_ >= Phase::symbolic) {
         pardiso_cleanup();
-        factorized_ = false;
     }
 
     n_ = n;
@@ -149,7 +147,90 @@ void PardisoMPI::set_matrix(int n, int local_nrows,
         local_a_.clear();
     }
 
-    matrix_set_ = true;
+    phase_ = Phase::matrix_set;
+}
+
+// ---------------------------------------------------------------------------
+// init_pardiso_params — set up iparm and pt for a fresh factorization
+// ---------------------------------------------------------------------------
+void PardisoMPI::init_pardiso_params()
+{
+    std::memset(pt_,    0, sizeof(pt_));
+    std::memset(iparm_, 0, sizeof(iparm_));
+
+    iparm_[0]  = 1;   // Use custom values (not defaults).
+    iparm_[1]  = 2;   // Nested dissection from METIS.
+    iparm_[34] = 0;   // 1-based indexing.
+    iparm_[39] = 2;   // Distributed assembled input.
+    iparm_[40] = first_row_;   // First row owned by this rank (1-based).
+    iparm_[41] = last_row_;    // Last row owned by this rank (1-based).
+}
+
+// ---------------------------------------------------------------------------
+// symbolic_factorize  (collective: phase 11)
+// ---------------------------------------------------------------------------
+void PardisoMPI::symbolic_factorize()
+{
+    if (phase_ < Phase::matrix_set)
+        throw std::runtime_error(
+            "symbolic_factorize() called before set_matrix()");
+
+    // If we already have a symbolic (or numeric) factorization, clean up
+    // before re-doing the symbolic phase.
+    if (phase_ >= Phase::symbolic) {
+        pardiso_cleanup();
+        // pardiso_cleanup sets phase_ to initial; restore to matrix_set
+        // since we still have valid matrix data after cleanup.
+        phase_ = Phase::matrix_set;
+    }
+
+    init_pardiso_params();
+
+    int phase = 11;
+    int error = 0;
+    int nrhs  = 0;
+    int idum  = 0;
+    double ddum = 0.0;
+
+    double* a_ptr  = !local_a_.empty()  ? local_a_.data()  : &ddum;
+    int*    ia_ptr = !local_ia_.empty() ? local_ia_.data() : &idum;
+    int*    ja_ptr = !local_ja_.empty() ? local_ja_.data() : &idum;
+
+    cluster_sparse_solver(pt_, &maxfct_, &mnum_, &mtype_, &phase,
+                          &n_, a_ptr, ia_ptr, ja_ptr,
+                          &idum, &nrhs, iparm_, &msglvl_,
+                          &ddum, &ddum, &comm_fortran_, &error);
+    check_pardiso_error(error, "symbolic factorization (phase 11)");
+
+    phase_ = Phase::symbolic;
+}
+
+// ---------------------------------------------------------------------------
+// numeric_factorize  (collective: phase 22)
+// ---------------------------------------------------------------------------
+void PardisoMPI::numeric_factorize()
+{
+    if (phase_ < Phase::symbolic)
+        throw std::runtime_error(
+            "numeric_factorize() called before symbolic_factorize()");
+
+    int phase = 22;
+    int error = 0;
+    int nrhs  = 0;
+    int idum  = 0;
+    double ddum = 0.0;
+
+    double* a_ptr  = !local_a_.empty()  ? local_a_.data()  : &ddum;
+    int*    ia_ptr = !local_ia_.empty() ? local_ia_.data() : &idum;
+    int*    ja_ptr = !local_ja_.empty() ? local_ja_.data() : &idum;
+
+    cluster_sparse_solver(pt_, &maxfct_, &mnum_, &mtype_, &phase,
+                          &n_, a_ptr, ia_ptr, ja_ptr,
+                          &idum, &nrhs, iparm_, &msglvl_,
+                          &ddum, &ddum, &comm_fortran_, &error);
+    check_pardiso_error(error, "numerical factorization (phase 22)");
+
+    phase_ = Phase::numeric;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,57 +238,27 @@ void PardisoMPI::set_matrix(int n, int local_nrows,
 // ---------------------------------------------------------------------------
 void PardisoMPI::factorize()
 {
-    if (!matrix_set_)
-        throw std::runtime_error("factorize() called before set_matrix()");
-
-    // (Re-)initialise PARDISO state on every rank.
-    std::memset(pt_,    0, sizeof(pt_));
-    std::memset(iparm_, 0, sizeof(iparm_));
-
-    // Set parameters.
-    iparm_[0]  = 1;   // Use custom values (not defaults).
-    iparm_[1]  = 2;   // Nested dissection from METIS.
-    iparm_[34] = 0;   // 1-based indexing.
-    iparm_[39] = 2;   // Distributed assembled input.
-    iparm_[40] = first_row_;   // First row owned by this rank (1-based).
-    iparm_[41] = last_row_;    // Last row owned by this rank (1-based).
-
-    int phase, error;
-    int nrhs = 0;   // No RHS during factorization.
-    int idum = 0;
-    double ddum = 0.0;
-
-    // Each rank passes its local data (or dummy pointers if no rows).
-    double* a_ptr  = !local_a_.empty()  ? local_a_.data()  : &ddum;
-    int*    ia_ptr = !local_ia_.empty() ? local_ia_.data() : &idum;
-    int*    ja_ptr = !local_ja_.empty() ? local_ja_.data() : &idum;
-
-    // Phase 11: symbolic factorization (collective).
-    phase = 11;
-    cluster_sparse_solver(pt_, &maxfct_, &mnum_, &mtype_, &phase,
-                          &n_, a_ptr, ia_ptr, ja_ptr,
-                          &idum, &nrhs, iparm_, &msglvl_,
-                          &ddum, &ddum, &comm_fortran_, &error);
-    check_pardiso_error(error, "symbolic factorization (phase 11)");
-
-    // Phase 22: numerical factorization (collective).
-    phase = 22;
-    cluster_sparse_solver(pt_, &maxfct_, &mnum_, &mtype_, &phase,
-                          &n_, a_ptr, ia_ptr, ja_ptr,
-                          &idum, &nrhs, iparm_, &msglvl_,
-                          &ddum, &ddum, &comm_fortran_, &error);
-    check_pardiso_error(error, "numerical factorization (phase 22)");
-
-    factorized_ = true;
+    symbolic_factorize();
+    numeric_factorize();
 }
 
 // ---------------------------------------------------------------------------
 // solve  (collective: phase 33, then allgather + inverse permute)
 // ---------------------------------------------------------------------------
-void PardisoMPI::solve(const double* rhs, double* sol)
+void PardisoMPI::solve(const double* rhs, double* sol, SolveType solve_type)
 {
-    if (!factorized_)
-        throw std::runtime_error("solve() called before factorize()");
+    if (phase_ < Phase::numeric)
+        throw std::runtime_error("solve() called before numeric factorization");
+
+    // Set iparm[11] to select the solve variant.
+    //   0 = normal solve:           A   x = rhs
+    //   1 = conjugate transpose:    A^H x = rhs
+    //   2 = transpose:              A^T x = rhs
+    switch (solve_type) {
+    case SolveType::normal:    iparm_[11] = 0; break;
+    case SolveType::transpose: iparm_[11] = 2; break;
+    case SolveType::adjoint:   iparm_[11] = 1; break;
+    }
 
     int phase = 33;
     int nrhs  = 1;
@@ -264,7 +315,7 @@ void PardisoMPI::solve(const double* rhs, double* sol)
 // ---------------------------------------------------------------------------
 void PardisoMPI::pardiso_cleanup()
 {
-    if (factorized_ || matrix_set_) {
+    if (phase_ >= Phase::symbolic) {
         int phase = -1;
         int nrhs  = 0;
         int error = 0;
@@ -295,6 +346,5 @@ void PardisoMPI::pardiso_cleanup()
     // Re-zero PARDISO handles.
     std::memset(pt_, 0, sizeof(pt_));
 
-    factorized_ = false;
-    matrix_set_ = false;
+    phase_ = Phase::initial;
 }
