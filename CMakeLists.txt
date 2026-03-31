@@ -35,40 +35,31 @@ else()
         set(MKL_INCLUDE_DIR "${MKLROOT}/include/mkl")
     endif()
 
-    # Prefer the single-dynamic-library link model (libmkl_rt).
-    find_library(MKL_RT_LIB mkl_rt
+    # Cluster PARDISO requires layered linking — libmkl_rt does not
+    # expose cluster_sparse_solver.
+    find_library(MKL_INTEL_LP64 mkl_intel_lp64
+        PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
+              "${MKLROOT}/lib/x86_64-linux-gnu")
+    find_library(MKL_SEQUENTIAL mkl_sequential
+        PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
+              "${MKLROOT}/lib/x86_64-linux-gnu")
+    find_library(MKL_CORE mkl_core
         PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
               "${MKLROOT}/lib/x86_64-linux-gnu")
 
-    if(MKL_RT_LIB)
-        set(MKL_LIBRARIES ${MKL_RT_LIB})
-    else()
-        # Static / layered linking as fallback.
-        # Cluster PARDISO requires BLACS in addition to the standard MKL libs.
-        find_library(MKL_INTEL_LP64 mkl_intel_lp64
-            PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
-                  "${MKLROOT}/lib/x86_64-linux-gnu")
-        find_library(MKL_SEQUENTIAL mkl_sequential
-            PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
-                  "${MKLROOT}/lib/x86_64-linux-gnu")
-        find_library(MKL_CORE mkl_core
-            PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
-                  "${MKLROOT}/lib/x86_64-linux-gnu")
+    # Pick the BLACS variant that matches the detected MPI implementation.
+    # Check for OpenMPI first (mpi_cxx or open-pal are OpenMPI-specific).
+    set(_blacs_name "mkl_blacs_intelmpi_lp64")
+    if(MPI_CXX_LIBRARIES MATCHES "openmpi" OR MPI_C_LIBRARIES MATCHES "openmpi")
+        set(_blacs_name "mkl_blacs_openmpi_lp64")
+    endif()
+    find_library(MKL_BLACS ${_blacs_name}
+        PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
+              "${MKLROOT}/lib/x86_64-linux-gnu")
 
-        # Try Intel MPI BLACS first, fall back to OpenMPI BLACS.
-        find_library(MKL_BLACS mkl_blacs_intelmpi_lp64
-            PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
-                  "${MKLROOT}/lib/x86_64-linux-gnu")
-        if(NOT MKL_BLACS)
-            find_library(MKL_BLACS mkl_blacs_openmpi_lp64
-                PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
-                      "${MKLROOT}/lib/x86_64-linux-gnu")
-        endif()
-
-        set(MKL_LIBRARIES ${MKL_INTEL_LP64} ${MKL_SEQUENTIAL} ${MKL_CORE})
-        if(MKL_BLACS)
-            list(APPEND MKL_LIBRARIES ${MKL_BLACS})
-        endif()
+    set(MKL_LIBRARIES ${MKL_INTEL_LP64} ${MKL_SEQUENTIAL} ${MKL_CORE})
+    if(MKL_BLACS)
+        list(APPEND MKL_LIBRARIES ${MKL_BLACS})
     endif()
 
     if(NOT EXISTS "${MKL_INCLUDE_DIR}/mkl.h")
@@ -101,7 +92,12 @@ if(MKL_FOUND)
     target_link_libraries(pardiso_mpi PUBLIC ${MKL_LIBRARIES})
 else()
     target_include_directories(pardiso_mpi PUBLIC ${MKL_INCLUDE_DIR})
-    target_link_libraries(pardiso_mpi PUBLIC ${MKL_LIBRARIES} pthread m dl)
+    # Use -Wl,--no-as-needed to ensure all MKL libraries (especially BLACS)
+    # are linked even when the linker does not see direct references to them.
+    # Cluster PARDISO loads BLACS symbols at runtime via libmkl_core.
+    target_link_libraries(pardiso_mpi PUBLIC
+        -Wl,--no-as-needed ${MKL_LIBRARIES} -Wl,--as-needed
+        pthread m dl)
 endif()
 
 # --------------------------------------------------------------------------
@@ -115,3 +111,6 @@ target_link_libraries(example_mmio PRIVATE pardiso_mpi)
 
 add_executable(example_sparse_solve examples/example_sparse_solve.cpp)
 target_link_libraries(example_sparse_solve PRIVATE pardiso_mpi)
+
+add_executable(example_complex examples/example_complex.cpp)
+target_link_libraries(example_complex PRIVATE pardiso_mpi)
