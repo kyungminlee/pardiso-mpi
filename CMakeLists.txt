@@ -48,11 +48,14 @@ else()
               "${MKLROOT}/lib/x86_64-linux-gnu")
 
     # Pick the BLACS variant that matches the detected MPI implementation.
-    # Check for OpenMPI first (mpi_cxx or open-pal are OpenMPI-specific).
+    # Default to Intel MPI / MPICH ABI; switch to OpenMPI when detected.
     set(_blacs_name "mkl_blacs_intelmpi_lp64")
-    if(MPI_CXX_LIBRARIES MATCHES "openmpi" OR MPI_C_LIBRARIES MATCHES "openmpi")
+    if(MPI_CXX_LIBRARIES MATCHES "openmpi" OR MPI_C_LIBRARIES MATCHES "openmpi"
+       OR MPI_CXX_COMPILER MATCHES "openmpi" OR MPI_C_COMPILER MATCHES "openmpi"
+       OR MPI_CXX_INCLUDE_DIRS MATCHES "openmpi" OR MPI_C_INCLUDE_DIRS MATCHES "openmpi")
         set(_blacs_name "mkl_blacs_openmpi_lp64")
     endif()
+    message(STATUS "Using MKL BLACS variant: ${_blacs_name}")
     find_library(MKL_BLACS ${_blacs_name}
         PATHS "${MKLROOT}/lib" "${MKLROOT}/lib/intel64"
               "${MKLROOT}/lib/x86_64-linux-gnu")
