@@ -26,7 +26,7 @@ int main(int argc, char* argv[])
     // Build triplets for 2D Laplacian (0-based indices).
     // Intentionally add the diagonal as two separate triplets to test
     // duplicate summation: 4.0 = 2.0 + 2.0.
-    std::vector<Triplet> triplets;
+    std::vector<Triplet<double>> triplets;
     for (int i = 0; i < N; ++i) {
         int gx = i % NX;
         int gy = i / NX;
@@ -49,7 +49,7 @@ int main(int argc, char* argv[])
     // Solve. Scope the solver so it is destroyed before MPI_Finalize.
     std::vector<double> sol(N, 0.0);
     {
-        SparseMatrixSolvePardiso solver(MPI_COMM_WORLD, N);
+        SparseMatrixSolvePardiso<double> solver(MPI_COMM_WORLD, N);
         solver.update(triplets);
         solver.solve(rhs.data(), sol.data());
     }
