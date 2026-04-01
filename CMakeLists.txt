@@ -15,6 +15,9 @@ find_package(MPI REQUIRED)
 # Try MKLConfig.cmake first (ships with oneAPI / standalone MKL).
 # Fall back to MKLROOT environment variable if the config is not found.
 # --------------------------------------------------------------------------
+set(MKL_INTERFACE lp64 CACHE STRING "MKL integer interface")
+set(MKL_THREADING sequential CACHE STRING "MKL threading layer")
+set(ENABLE_BLACS ON CACHE BOOL "Enable MKL BLACS for Cluster PARDISO")
 find_package(MKL CONFIG QUIET)
 
 if(MKL_FOUND)
@@ -92,7 +95,14 @@ target_link_libraries(pardiso_mpi PUBLIC MPI::MPI_CXX)
 
 # MKL
 if(MKL_FOUND)
-    target_link_libraries(pardiso_mpi PUBLIC ${MKL_LIBRARIES})
+    # Prefer MKL::MKL_BLACS (includes BLACS for Cluster PARDISO); fall back to MKL::MKL.
+    # Use --no-as-needed to ensure BLACS is linked even without direct references
+    # (Cluster PARDISO loads BLACS symbols at runtime via libmkl_core).
+    if(TARGET MKL::MKL_BLACS)
+        target_link_libraries(pardiso_mpi PUBLIC -Wl,--no-as-needed MKL::MKL_BLACS -Wl,--as-needed)
+    else()
+        target_link_libraries(pardiso_mpi PUBLIC ${MKL_LIBRARIES})
+    endif()
 else()
     target_include_directories(pardiso_mpi PUBLIC ${MKL_INCLUDE_DIR})
     # Use -Wl,--no-as-needed to ensure all MKL libraries (especially BLACS)
