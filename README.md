@@ -13,8 +13,25 @@ systems.
 
 - CMake 3.15+
 - C++17 compiler
-- MPI implementation (OpenMPI, MPICH, Intel MPI, etc.)
-- Intel MKL (oneAPI or standalone) with Cluster PARDISO support
+- MPI implementation (Intel MPI recommended; MPICH and OpenMPI also supported)
+- Intel MKL with Cluster PARDISO support
+
+### Recommended: Intel MPI + oneAPI MKL (via pip)
+
+Intel MPI and oneAPI MKL can be installed via pip, which provides the
+most complete support (including complex multi-rank solves):
+
+```bash
+pip install mkl mkl-devel impi-rt impi-devel
+```
+
+### MPI compatibility notes
+
+| MPI | Real (np>1) | Complex (np>1) | Notes |
+|-----|:-----------:|:--------------:|-------|
+| Intel MPI | Yes | Yes | Recommended; full support |
+| MPICH | Yes | No | `MPI_SUM` not defined for `MPI_C_DOUBLE_COMPLEX` |
+| OpenMPI | Depends | Depends | Requires ABI-compatible MKL BLACS |
 
 ## Build
 
@@ -29,6 +46,19 @@ If CMake cannot find MKL automatically, set the `MKLROOT` environment variable:
 ```bash
 export MKLROOT=/opt/intel/oneapi/mkl/latest
 cmake ..
+```
+
+When using Intel MPI installed via pip, set `I_MPI_ROOT` and ensure the
+linker finds the correct libraries:
+
+```bash
+export I_MPI_ROOT=/usr/local
+cmake .. \
+  -DCMAKE_C_COMPILER=/usr/local/bin/mpicc \
+  -DCMAKE_CXX_COMPILER=/usr/local/bin/mpicxx \
+  -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/lib -Wl,-rpath,/usr/local/lib" \
+  -DENABLE_BLACS=ON -DMKL_MPI=intelmpi
+make -j
 ```
 
 ## Usage
@@ -115,6 +145,8 @@ correctness.
 
 ## Example Output
 
+Tested with Intel MPI 2021.17 + MKL 2025.3 on 4 MPI ranks.
+
 ### `mpirun -np 4 ./example_direct`
 
 ```
@@ -124,8 +156,8 @@ Solution:
   ...
   x[15] = 1.000000e+00  (exact = 1.000000e+00)
 
-Residual ||Ax - b||_2 = 1.332268e-15
-Solution error ||x - x_exact||_2 = 4.577567e-16
+Residual ||Ax - b||_2 = 9.019494e-16
+Solution error ||x - x_exact||_2 = 2.220446e-16
 ```
 
 ### `mpirun -np 4 ./example_sparse_solve`
@@ -136,7 +168,7 @@ Solution:
   ...
   x[15] = 1.000000e+00
 
-||x - x_exact||_2 = 4.577567e-16
+||x - x_exact||_2 = 2.220446e-16
 ```
 
 ### `mpirun -np 4 ./example_complex`
@@ -144,11 +176,11 @@ Solution:
 ```
 Solution (complex shifted Laplacian):
   x[ 0] = (1.000000e+00, -5.465713e-17)
-  x[ 1] = (1.000000e+00, -1.445328e-16)
-  x[ 2] = (1.000000e+00, -1.055744e-16)
+  x[ 1] = (1.000000e+00, -3.615026e-17)
+  x[ 2] = (1.000000e+00, -5.278720e-17)
   ...
-  x[14] = (1.000000e+00, -1.443042e-16)
-  x[15] = (1.000000e+00, -5.465713e-17)
+  x[14] = (1.000000e+00, -7.230061e-17)
+  x[15] = (1.000000e+00, -2.732857e-17)
 
-||x - x_exact||_2 = 1.168640e-15
+||x - x_exact||_2 = 8.966173e-16
 ```
